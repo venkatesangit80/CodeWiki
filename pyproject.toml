@@ -80,6 +80,7 @@ dev = [
 
 [project.scripts]
 codewiki = "codewiki.cli.main:cli"
+codedoc-gen = "codedoc_generator.main:cli"
 
 [project.urls]
 Homepage = "https://github.com/yourusername/codewiki"
@@ -105,7 +106,8 @@ packages = [
     "codewiki.src.be.dependency_analyzer.utils",
     "codewiki.src.fe",
     "codewiki.mcp",
-    "codewiki.mcp.tools"
+    "codewiki.mcp.tools",
+    "codedoc_generator"
 ]
 
 [tool.setuptools.package-data]
