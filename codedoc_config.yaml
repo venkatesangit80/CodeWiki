@@ -1,0 +1,33 @@
+analysis:
+  call_graph_traversal_depth: 5
+  ignore_paths:
+  - .git
+  - node_modules
+  - dist
+  - build
+  - __pycache__
+  - venv
+  module_granularity: directory
+embedding:
+  endpoint: http://localhost:11434/v1
+  model: nomic-embed-text
+  provider: ollama
+github:
+  auth_token_env: GITHUB_PAT
+llm:
+  context_window_tokens: 128000
+  endpoint: http://localhost:11434/v1
+  model: qwen2.5-coder:7b
+  provider: ollama
+  temperature: 0.2
+output:
+  formats:
+  - markdown
+  output_dir: ./docs/codedoc
+repos:
+- branch: main
+  local_path: .
+  repo_id: fsoft-ai4code/codewiki
+vector_store:
+  backend: sqlite
+  path: ./.codedoc/vector_store
