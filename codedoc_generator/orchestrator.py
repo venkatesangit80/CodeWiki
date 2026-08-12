@@ -382,7 +382,8 @@ class GeneratorOrchestrator:
                 "You are a principal software architect. You are writing the final 'Architecture & Operations Synthesis' report for a system.\n"
                 "Analyze the technical stack, data flows, and performance characteristics with extreme technical accuracy and professional tone.\n"
                 "Specifically audit the code for resource leaks, native memory allocation JNI risks (e.g. instantiating objects like XPRB without properly disposing/closing them), thread lock bottlenecks, or suboptimal loops.\n"
-                "Be detailed, descriptive, and reference code symbols/files precisely."
+                "Be detailed, descriptive, and reference code symbols/files precisely.\n"
+                "CRITICAL MERMAID SYNTAX RULE: If you generate any Mermaid diagrams, you MUST wrap any node labels containing parenthesis, brackets, or other special characters in double quotes to prevent rendering syntax errors (e.g. J[\"OptModel (JNI)\"] or K[\"Output Service\"])."
             )
             
             user_content = (
