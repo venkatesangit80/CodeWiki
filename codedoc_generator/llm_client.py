@@ -100,7 +100,7 @@ class NatsCompletionsClient(BaseLLMClient):
                     "temperature": self.config.llm.temperature,
                     "max_tokens": 4000,
                     "source": "codedoc-generator",
-                    "enable_thinking": True,
+                    "enable_thinking": False,
                 },
                 "stream": False,
                 "timestamp": str(uuid.uuid1()),
