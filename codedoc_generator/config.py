@@ -17,8 +17,8 @@ class LLMConfig(BaseModel):
     model: str = "qwen2.5-coder:7b"
     context_window_tokens: int = 128000
     temperature: float = 0.2
-    nats_user: Optional[str] = "js_everyops"
-    nats_password: Optional[str] = "8BcUaUYxOnVG8g1T"
+    nats_user: Optional[str] = None
+    nats_password: Optional[str] = None
 
 class EmbeddingConfig(BaseModel):
     provider: str = "ollama"
