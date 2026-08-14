@@ -7,10 +7,12 @@ class RepoConfig(BaseModel):
     repo_id: str
     branch: Optional[str] = "main"
     local_path: Optional[str] = None  # If already cloned/local
+    url: Optional[str] = None
 
 class GitHubConfig(BaseModel):
     auth_token_env: str = "GITHUB_PAT"
     token: Optional[str] = None
+    api_endpoint: str = "https://api.github.com"
 
 class LLMConfig(BaseModel):
     provider: str = "ollama"  # ollama | vllm | lmstudio | openai-compatible | nats
