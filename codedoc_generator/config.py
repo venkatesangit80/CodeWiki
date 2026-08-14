@@ -10,6 +10,7 @@ class RepoConfig(BaseModel):
 
 class GitHubConfig(BaseModel):
     auth_token_env: str = "GITHUB_PAT"
+    token: Optional[str] = None
 
 class LLMConfig(BaseModel):
     provider: str = "ollama"  # ollama | vllm | lmstudio | openai-compatible | nats
