@@ -5,6 +5,8 @@ import yaml
 import click
 import asyncio
 import logging
+import subprocess
+import re
 from typing import Dict, List, Any
 
 # Local imports
@@ -40,23 +42,7 @@ def init(repo_path: str, repo_id: str):
     config.save_to_yaml(config_path)
     click.echo(f"Initialized default configuration in {config_path}")
 
-@cli.command()
-@click.option("--config", "config_file", default="codedoc_config.yaml", help="Path to configuration YAML")
-def generate(config_file: str):
-    """Scans code, builds graphs, indexes vectors, and generates documents"""
-    if not os.path.exists(config_file):
-        click.echo(f"Config file '{config_file}' not found. Run 'codedoc-gen init' first.")
-        sys.exit(1)
-
-    logger.info(f"Loading configuration from {config_file}")
-    config = GeneratorConfig.load_from_yaml(config_file)
-    
-    if not config.repos:
-        logger.error("No repositories configured in YAML.")
-        sys.exit(1)
-
-    # We will process the first repo configured
-    repo_cfg = config.repos[0]
+def _run_generation(config: GeneratorConfig, repo_cfg: RepoConfig):
     repo_id = repo_cfg.repo_id
     local_path = repo_cfg.local_path or "."
 
@@ -212,10 +198,95 @@ def generate(config_file: str):
     ingestor.commit_state()
     logger.info("Documentation generation successfully completed!")
 
+@cli.command()
+@click.option("--config", "config_file", default="codedoc_config.yaml", help="Path to configuration YAML")
+def generate(config_file: str):
+    """Scans code, builds graphs, indexes vectors, and generates documents"""
+    if not os.path.exists(config_file):
+        click.echo(f"Config file '{config_file}' not found. Run 'codedoc-gen init' first.")
+        sys.exit(1)
+
+    logger.info(f"Loading configuration from {config_file}")
+    config = GeneratorConfig.load_from_yaml(config_file)
+    
+    if not config.repos:
+        logger.error("No repositories configured in YAML.")
+        sys.exit(1)
+
+    # We will process the first repo configured
+    repo_cfg = config.repos[0]
+    _run_generation(config, repo_cfg)
+
+@cli.command()
+@click.option("--github-url", required=True, help="GitHub clone URL (HTTPS) or org/repo identifier")
+@click.option("--github-token", default=None, help="GitHub Personal Access Token (PAT)")
+@click.option("--config", "config_file", default="codedoc_config.yaml", help="Path to configuration YAML")
+@click.option("--output-dir", default=None, help="Directory to save the generated docs (overrides config)")
+def clone_and_generate(github_url: str, github_token: str, config_file: str, output_dir: str):
+    """Clones a remote GitHub repository using a PAT token and generates documentation"""
+    # 1. Normalize github_url
+    url = github_url.strip()
+    if not url.startswith("http") and "/" in url:
+        url = f"https://github.com/{url}"
+    if not url.endswith(".git"):
+        url = url + ".git"
+        
+    # Extract repo name for local directory
+    # e.g., https://github.com/org/repo.git -> org_repo
+    match = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
+    if match:
+        org, repo_name = match.group(1), match.group(2)
+        local_dir = f"./repos/{org}_{repo_name}"
+        repo_id = f"{org}/{repo_name}"
+    else:
+        local_dir = "./repos/cloned_repo"
+        repo_id = "cloned/repo"
+        
+    os.makedirs("./repos", exist_ok=True)
+    
+    # Inject token into URL if present
+    auth_url = url
+    sanitized_url = url
+    if github_token:
+        auth_url = url.replace("https://", f"https://{github_token}@")
+        sanitized_url = url.replace("https://", "https://***@")
+        
+    try:
+        if os.path.exists(local_dir):
+            logger.info(f"Directory {local_dir} already exists. Pulling latest changes...")
+            subprocess.run(["git", "pull"], cwd=local_dir, check=True)
+        else:
+            logger.info(f"Cloning {sanitized_url} into {local_dir}...")
+            subprocess.run(["git", "clone", auth_url, local_dir], check=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Git operation failed: {e}")
+        click.echo("Error: Git operation failed. Please verify the URL and Personal Access Token.")
+        sys.exit(1)
+        
+    # 2. Load or initialize configuration
+    if os.path.exists(config_file):
+        logger.info(f"Loading configuration from {config_file}")
+        config = GeneratorConfig.load_from_yaml(config_file)
+    else:
+        logger.info(f"No config file found. Using default settings.")
+        config = GeneratorConfig()
+        
+    # Override configuration repository and path
+    repo_cfg = RepoConfig(repo_id=repo_id, local_path=local_dir)
+    config.repos = [repo_cfg]
+    
+    if github_token:
+        config.github.token = github_token
+        
+    if output_dir:
+        config.output.output_dir = output_dir
+        
+    # 3. Run generation pipeline
+    _run_generation(config, repo_cfg)
+
 def ast_parse(content: str) -> ast.AST:
     # A helper that handles empty files or parsing failures
     try:
         return ast.parse(content)
     except SyntaxError:
-        # Retry by cleaning up syntax errors or fallback to empty module
         return ast.parse("")
