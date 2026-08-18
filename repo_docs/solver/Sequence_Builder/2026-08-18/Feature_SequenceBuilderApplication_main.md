@@ -13,37 +13,31 @@ sequenceDiagram
 
 ## 2. Walkthrough Explanation & Narrative
 
-### Execution Trace Narration: `SequenceBuilderApplication` Initialization
+### Execution Trace Narration: SequenceBuilderApplication Initialization
 
 **Overview**
-The execution flow initiates at the standard Java entry point, `main`, within the `SequenceBuilderApplication` class. This method serves as the bootstrap mechanism for the Spring Boot application, delegating the core initialization logic to the Spring framework's runtime engine.
+The execution flow initiates at the standard Java entry point, `SequenceBuilderApplication.main`, located within the Spring Boot application's primary class. This method serves as the bootstrap mechanism to launch the Spring application context.
 
-**Detailed Execution Path**
+**Execution Path & Logic Analysis**
+Upon invocation of the `main` method, the control flow immediately delegates to the `SpringApplication` utility class. Specifically, the static method `run` is invoked with two critical arguments:
+1.  **Target Class**: `SequenceBuilderApplication.class`, which identifies the specific configuration and component scan root for the application.
+2.  **Arguments**: The `String[] args` array, passed directly from the JVM to allow command-line argument propagation into the Spring context.
 
-1.  **Entry Point Invocation**:
-    The JVM locates and invokes the `main` method defined in `src/main/java/com/aa/fso/SequenceBuilderApplication.java`. This method accepts the standard command-line arguments (`String[] args`), which may contain configuration flags or profiles passed by the user.
+This single line of code triggers the comprehensive Spring Boot startup lifecycle, including:
+*   Context initialization.
+*   Component scanning for beans.
+*   Auto-configuration of the application environment.
+*   Startup of embedded servers (if applicable).
 
-2.  **Spring Context Bootstrapping**:
-    Inside the `main` method, the execution immediately delegates to `SpringApplication.run()`. This is a high-level utility method provided by the Spring Boot library. Its responsibilities include:
-    *   Creating a new `ApplicationContext` instance.
-    *   Scanning the classpath for component classes (e.g., `@Component`, `@Service`, `@Controller`).
-    *   Instantiating beans and resolving dependencies based on the application context configuration.
-    *   Starting embedded web servers (if applicable) or initializing background tasks.
+No explicit conditional logic or data mutation occurs within this specific snippet; the operation is a direct delegation to the framework's core engine.
 
-3.  **Control Flow**:
-    The `main` method does not perform any custom logic prior to this delegation. It acts purely as a conduit, passing the application class reference and the raw arguments directly to the Spring container. Consequently, the control flow transfers out of the `SequenceBuilderApplication` class into the internal lifecycle of the `SpringApplication` class, where the actual application startup sequence begins.
+**Final Output**
+The method does not return a value to the caller in the traditional sense. Instead, it blocks the main thread until the Spring application context is fully initialized and the application is ready to serve requests, or until the application is explicitly shut down. The process effectively transitions the system state from a standalone Java process to a running Spring Boot application.
 
-**Data Mutations and Conditionals**
-*   **Mutations**: No explicit variable assignments or state mutations occur within the visible scope of the `main` method itself. The primary mutation happens internally within `SpringApplication.run()`, where the application context is constructed and populated with bean definitions.
-*   **Conditionals**: There are no conditional statements (`if`, `switch`) or loops present in this specific snippet. The execution path is linear and deterministic.
-
-**Final Return Output**
-The `main` method returns `void`. The application remains active as long as the Spring `ApplicationContext` is running. The process terminates only when the application context is closed or the JVM receives a shutdown signal.
-
-**Source Reference**
-*   `src/main/java/com/aa/fso/SequenceBuilderApplication.java:10-14`
-    ```java
-    public static void main(String[] args) {
-      SpringApplication.run(SequenceBuilderApplication.class, args);
-    }
-    ```
+**Code Reference**
+[SequenceBuilderApplication.java:6-9]
+```java
+public static void main(String[] args) {
+    SpringApplication.run(SequenceBuilderApplication.class, args);
+}
+```

@@ -2,13 +2,13 @@
 
 ## 1. SRE Vulnerability Summary
 
-*   **Critical Resource Leak:** `HttpURLConnection` instances are instantiated inside `LegDataRepositoryImpl.connectToFOS` without guaranteed closure in all exception paths, risking socket exhaustion under load.
-*   **Native Memory Leak Risk:** `OptModel` initializes FICO Xpress native objects (`XPRS`, `XPRB`) in `runModel` but lacks explicit `close()` or `dispose()` calls in a `finally` block, potentially leaking native heap memory across multiple optimization runs.
-*   **High GC Pressure:** Excessive `DutyInfo::deepCopy` operations occur inside tight loops in `ShortestPathComponent.identifyDhdFromBase` and `identifyDhdToBase`, creating significant garbage generation during pairing generation.
-*   **Concurrency Hazard:** Validation rules (e.g., `PilotRedeyeRule`, `BaseLayover`) mutate shared `UnsequencedLegPairing` objects (setting `redeye` flags) during iteration, risking race conditions if the same pairing instance is processed concurrently or reused.
-*   **Inefficient Data Structures:** `FSOUtil.daysBetween` implements an O(N) linear scan using `plusDays` in a loop instead of utilizing `ChronoUnit.DAYS.between` for O(1) calculation.
-*   **Missing State TTL:** While not a Flink job, the codebase relies heavily on in-memory `Map` structures (`labelsMap`, `dhdHM`) that grow indefinitely without eviction policies, risking OutOfMemory errors on large datasets.
-*   **Azure Client Instantiation:** `BlobClient` is instantiated inside the `saveData` loop in `AzureBlobRepositoryImpl`, preventing connection pooling and increasing latency.
+*   **Critical Resource Leak:** `HttpURLConnection` instances are instantiated inside `LegDataRepositoryImpl.connectToFOS` without guaranteed closure in `finally` blocks, risking socket exhaustion under high load.
+*   **Native Memory Leak Risk:** `OptModel` (FICO Xpress) initializes native C++ optimizer instances (`XPRS`, `XPRB`) inside the `optimize` method but lacks explicit `dispose()` or `close()` calls in a `finally` block, leading to native heap accumulation.
+*   **High GC Pressure:** Aggressive use of `DutyInfo::deepCopy` inside tight loops (`identifyDhdFromBase`, `identifyDhdToBase`, `updateDutyInfoList`) creates massive object churn, likely triggering frequent Full GCs.
+*   **Concurrency Hazard:** Validation rules (e.g., `PilotRedeyeRule`, `BaseLayover`) mutate shared input objects (`UnsequencedLegPairing`, `DutyInfo`) directly (e.g., `setRedeye`, `setFlightsWithInDuty`), causing race conditions if pairings are reused or cached.
+*   **Inefficient Data Structures:** `FSOUtil.daysBetween` implements an O(N) linear scan using `plusDays` instead of utilizing `ChronoUnit.DAYS.between` for O(1) calculation.
+*   **Missing State TTL:** While not a Flink job, the codebase lacks explicit state cleanup mechanisms for large in-memory maps (`labelsMap`, `dhdHM`) which could grow indefinitely without bounds checking.
+*   **Azure Client Instantiation:** `BlobClient` is created inside the `saveData` loop in `AzureBlobRepositoryImpl`, preventing connection pooling and increasing latency.
 
 ---
 
@@ -16,160 +16,176 @@
 
 ### 2.1 Connection & Resource Leaks
 **Severity:** Critical
-**Impact:** Socket exhaustion, `OutOfMemoryError`, application hangs.
+**Impact:** Socket exhaustion, `OutOfMemoryError` (direct buffers), Service Unavailability.
 
-The `LegDataRepositoryImpl.connectToFOS` method creates a new `HttpURLConnection` for every script execution. While `try-with-resources` is used for streams, the `HttpURLConnection` itself is not explicitly closed in the `catch` blocks or if an exception occurs before the `try` block completes its scope properly. If the pool of connections is exhausted, subsequent requests will fail.
+The `LegDataRepositoryImpl.connectToFOS` method opens an `HttpURLConnection` but relies on `try-with-resources` only for the inner streams (`OutputStream`, `BufferedReader`). If an exception occurs before entering the inner `try` blocks, or if the outer `try` block fails, the connection itself may not be closed.
 
-**File:** `src/main/java/com/aa/fso/repository/LegDataRepositoryImpl.java`
-**Lines:** [L1-L45] (approximate based on snippet)
-
-```java
-public  String connectToFOS(String script) throws IOException {
-    StringBuilder response = new StringBuilder();
-    try {
-        URL FosUpdate = new URL("https://tapi.adt.aa.com/Service.svc");
-        HttpURLConnection conn = (HttpURLConnection) FosUpdate.openConnection();
-        // ... setup headers ...
-        
-        // Stream handling is okay, but conn.close() is missing in finally
-        try (OutputStream os = conn.getOutputStream()) { ... }
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) { ... }
-        
-    } catch (Exception e) {
-        e.printStackTrace();
-        // Connection leak here if exception occurs before streams are closed
+*   **File:** `src/main/java/com/aa/fso/repository/LegDataRepositoryImpl.java`
+*   **Lines:** `L1-L45` (approximate based on snippet)
+*   **Snippet:**
+    ```java
+    public String connectToFOS(String script) throws IOException {
+        StringBuilder response = new StringBuilder();
+        try {
+            URL FosUpdate = new URL("https://tapi.adt.aa.com/Service.svc");
+            HttpURLConnection conn = (HttpURLConnection) FosUpdate.openConnection();
+            // ... setup ...
+            try (OutputStream os = conn.getOutputStream()) { // Stream closed, but conn might not be
+                os.write(script.getBytes());
+                // ...
+            }
+            // ...
+        } catch (Exception e) {
+            e.printStackTrace();
+            // Connection 'conn' is leaked here if exception happens before try-with-resources
+        }
+        return response.toString();
     }
-    return response.toString();
-}
-```
+    ```
 
-**Recommendation:** Wrap the entire logic in a `try-with-resources` block ensuring `HttpURLConnection` is closed, or explicitly call `conn.disconnect()` in a `finally` block.
+**Recommendation:** Wrap the entire connection logic in a `try-with-resources` block or ensure `conn.disconnect()` is called in a `finally` block.
 
 ### 2.2 Native JNI C++ Memory Leaks
 **Severity:** Critical
-**Impact:** Native heap exhaustion, eventual crash of the JVM process.
+**Impact:** Native Heap Overflow, Application Crash (OOM), System Instability.
 
-The `OptModel` class interacts with the FICO Xpress Optimizer (C++ library). The `runModel` method initializes the solver environment and problem instances. However, there is no corresponding cleanup logic to free these native resources after the optimization completes. In a long-running service processing multiple snapshots, native memory will accumulate until the OS kills the process.
+The `OptModel` class interacts with the FICO Xpress Optimizer. The `runModel` method accesses native objects (`model.getXPRSprob()`, `model.mipOptimize()`). There is no evidence of a `close()`, `dispose()`, or `delete` call for the native model instance after the optimization completes. If this service runs continuously or processes multiple snapshots sequentially without restarting, native memory will leak.
 
-**File:** `src/main/java/com/aa/fso/optmodel/OptModel.java`
-**Lines:** [L1-L50] (approximate based on snippet)
+*   **File:** `src/main/java/com/aa/fso/optmodel/OptModel.java`
+*   **Lines:** `L1-L60` (approximate)
+*   **Snippet:**
+    ```java
+    public void runModel(RunStateManager runStateManager) throws KillRunException {
+        model.getXPRSprob().setDblControl(XPRS.MIPTOL, ModelParams.C_MIPTOLERANCE);
+        // ...
+        model.mipOptimize("d");
+        // ...
+        // NO CLEANUP HERE
+    }
+    ```
+    *Note: The `OptModel` constructor likely initializes the native environment. Without a corresponding destructor or explicit close method called after `parseSolution`, the native heap grows.*
 
-```java
-public void runModel(RunStateManager runStateManager) throws KillRunException {
-    // ... model initialization happens in initialize() ...
-    model.getXPRSprob().setDblControl(...);
-    model.mipOptimize("d");
-    
-    // ... parsing solution ...
-    
-    // NO CLEANUP: model.dispose() or similar native cleanup is missing
-    // If this method is called repeatedly, native memory leaks.
-}
-```
-
-**Recommendation:** Implement a `close()` or `dispose()` method in `OptModel` that calls the native library's cleanup functions. Ensure this is called in a `finally` block in the service layer after `runModel` completes.
+**Recommendation:** Implement a `close()` method in `OptModel` that calls the native Xpress cleanup routines and invoke it in a `finally` block within `OptimizationServiceImpl.optimize`.
 
 ### 2.3 High Memory Allocation Churn & GC Pressure
 **Severity:** High
-**Impact:** Increased GC frequency, latency spikes, reduced throughput.
+**Impact:** High Latency, Frequent Full GCs, Throughput degradation.
 
-Inside `identifyDhdFromBase` and `identifyDhdToBase`, a new `UnsequencedLegPairing` and a deep copy of the entire `DutyInfo` list are created for *every* potential deadhead leg checked. This happens inside nested loops iterating over dates and flight legs.
+The code performs deep cloning of complex objects (`DutyInfo`) inside nested loops used for generating candidate pairings. This is particularly evident in `identifyDhdFromBase` and `identifyDhdToBase` where a temporary pairing is created for every potential deadhead leg check.
 
-**File:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
-**Lines:** [L145-L165] (approximate based on snippet)
-
-```java
-for (int f = flightLegs.size() - 1; f >= 0; f--) {
-    UnsequencedLeg flightLeg = flightLegs.get(f);
-
-    // CRITICAL: Deep copying the entire duty list for every candidate leg
-    UnsequencedLegPairing tempPairing = new UnsequencedLegPairing(pairing);
-    tempPairing.setFlightDutyPeriods(pairing.getFlightDutyPeriods().stream()
-            .map(DutyInfo::deepCopy) // Expensive operation
-            .collect(Collectors.toList()));
-            
-    // ... logic ...
-}
-```
+*   **File:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
+*   **Lines:** `L230-245` (inside `identifyDhdFromBase`)
+*   **Snippet:**
+    ```java
+    for (int f = flightLegs.size() - 1; f >= 0; f--) {
+        UnsequencedLeg flightLeg = flightLegs.get(f);
+        // CRITICAL: Creates a new Pairing and Deep Copies entire DutyInfoList for EVERY iteration
+        UnsequencedLegPairing tempPairing = new UnsequencedLegPairing(pairing);
+        tempPairing.setFlightDutyPeriods(pairing.getFlightDutyPeriods().stream()
+                .map(DutyInfo::deepCopy) // Expensive operation
+                .collect(Collectors.toList()));
+        
+        // ... logic ...
+        if (isDhdLegal(...)) {
+            // ...
+            return;
+        }
+    }
+    ```
+    *Context:* If `flightLegs` contains 100 items and `pairing` has 5 duties, this creates 500+ `DutyInfo` clones per loop iteration.
 
 **Recommendation:**
-1.  **Lazy Evaluation:** Avoid deep copying unless the legality check actually requires modification. Pass the original object and a "delta" or "context" object to the validator.
-2.  **Object Pooling:** If deep copies are unavoidable, consider an object pool for `DutyInfo` and `UnsequencedLegPairing` to reduce allocation overhead.
-3.  **Early Exit:** Move expensive checks (like `isDhdLegal`) earlier in the loop if possible to avoid unnecessary cloning.
+1.  Avoid deep copying if possible. Pass a copy-only-on-modification strategy.
+2.  If deep copy is required, reuse a single `tempPairing` object and manually reset fields instead of creating a new instance every loop.
+3.  Profile the `deepCopy` implementation to ensure it isn't doing unnecessary work.
 
 ### 2.4 Concurrency Hazards / Shared Object Mutation
 **Severity:** High
-**Impact:** Data corruption, incorrect legality results, race conditions.
+**Impact:** Data Corruption, Incorrect Legalities, Race Conditions.
 
-Validation rules like `PilotRedeyeRule` and `BaseLayover` modify the state of the input `UnsequencedLegPairing` object (e.g., setting `redeye` flags) during the validation process. If the same `pairing` instance is passed to multiple threads or reused in a subsequent operation before the validation is complete, the state will be corrupted.
+Validation rules are designed to be stateless but are mutating the input `UnsequencedLegPairing` and its internal `DutyInfo` objects. Since these pairings are often part of a larger solution space or cached, mutating them during validation causes side effects.
 
-**File:** `src/main/java/com/aa/fso/contractualrules/PilotRedeyeRule.java`
-**Lines:** [L15-L30] (approximate based on snippet)
-
-```java
-private boolean checkRedeyeDuty(UnsequencedLegPairing sequenceInfo, Map<String, Integer> hashMap) {
-    // MUTATION: Modifying the input object's state
-    if(sequenceInfo.getRedeye() != null) {
-         sequenceInfo.setRedeye(null); // Resetting state
-    }
-    // ...
-    for (DutyInfo dutyPeriod : dutyPeriods) {
+*   **File:** `src/main/java/com/aa/fso/contractualrules/PilotRedeyeRule.java`
+*   **Lines:** `L15-L30` (inside `checkRedeyeDuty`)
+*   **Snippet:**
+    ```java
+    private boolean checkRedeyeDuty(UnsequencedLegPairing sequenceInfo, Map<String, Integer> hashMap) {
+        // MUTATION: Setting state on the input object
+        if(sequenceInfo.getRedeye() != null) {
+             sequenceInfo.setRedeye(null); // Clearing state
+        }
         // ...
-        dutyPeriod.setRedeye(true); // Mutating child object
-        sequenceInfo.setRedeye(true); // Mutating parent object
+        for (DutyInfo dutyPeriod : dutyPeriods) {
+            // MUTATION: Modifying the duty object passed in
+            dutyPeriod.setRedeye(true); // Side effect!
+            sequenceInfo.setRedeye(true);
+        }
+        return redeye;
     }
-    return redeye;
-}
-```
+    ```
+*   **File:** `src/main/java/com/aa/fso/contractualrules/BaseLayover.java`
+*   **Lines:** `L15-L25`
+*   **Snippet:**
+    ```java
+    // MUTATION: Modifying the list directly
+    List<Node> flights = dutyPeriod.getFlightsWithInDuty();
+    // ... logic ...
+    // If this method is called on a shared object, the list is modified.
+    ```
 
 **Recommendation:**
-1.  **Immutable Validation:** Refactor validation rules to accept a copy of the object or return a result object containing the calculated flags rather than mutating the input.
-2.  **Thread Safety:** If the input objects are immutable, this is safe. If they are mutable and shared, ensure strict single-threaded access or synchronize access.
+1.  **Immutable Validation:** Validation methods should accept immutable copies or read-only views.
+2.  **Separate State:** Store validation results (e.g., `isRedeye`) in a separate metadata map or a wrapper object, not on the domain entity itself.
+3.  **Defensive Copying:** If mutation is unavoidable for performance, ensure the caller knows they are receiving a mutated object, or clone the object *before* passing it to the validator.
 
 ### 2.5 Inefficient Data Structures
 **Severity:** Medium
-**Impact:** CPU waste, slower execution time.
+**Impact:** CPU Waste, Increased Latency.
 
-The `daysBetween` utility method calculates the difference between two dates using a `while` loop incrementing by one day. This is O(N) where N is the number of days. For a 7-day window, it's negligible, but for larger ranges or high-frequency calls, it is inefficient.
+The `daysBetween` utility method uses a `while` loop to increment days one by one. For large date ranges, this is significantly slower than the built-in `ChronoUnit` API.
 
-**File:** `src/main/java/com/aa/fso/util/FSOUtil.java`
-**Lines:** [L1-L10] (approximate based on snippet)
-
-```java
-public static int daysBetween(LocalDateTime startDateTime, LocalDateTime endDateTime) {
-    LocalDate startDate = startDateTime.toLocalDate();
-    LocalDate endDate = endDateTime.toLocalDate();
-
-    int days = 0;
-    while (startDate.isBefore(endDate) && !startDate.equals(endDate)) {
-      days++;
-      startDate = startDate.plusDays(1); // Linear scan
+*   **File:** `src/main/java/com/aa/fso/util/FSOUtil.java`
+*   **Lines:** `L100-L110`
+*   **Snippet:**
+    ```java
+    public static int daysBetween(LocalDateTime startDateTime, LocalDateTime endDateTime) {
+        LocalDate startDate = startDateTime.toLocalDate();
+        LocalDate endDate = endDateTime.toLocalDate();
+        int days = 0;
+        // O(N) Linear Scan
+        while (startDate.isBefore(endDate) && !startDate.equals(endDate)) {
+          days++;
+          startDate = startDate.plusDays(1); // Expensive operation in loop
+        }
+        days++;
+        return days;
     }
-    days++;
-    return days;
-}
-```
+    ```
 
 **Recommendation:** Replace with `ChronoUnit.DAYS.between(startDateTime.toLocalDate(), endDateTime.toLocalDate())`.
 
-### 2.6 Azure Blob Client Leaks
+### 2.6 Connection & Resource Leaks (Azure)
 **Severity:** Medium
-**Impact:** Latency increase, connection pool exhaustion.
+**Impact:** Latency, Connection Pool Exhaustion.
 
-In `AzureBlobRepositoryImpl.saveData`, a new `BlobClient` is built and used inside the method. While the `try-with-resources` block closes the stream, the `BlobClient` itself might hold underlying connections that are not pooled efficiently if created frequently.
+`AzureBlobRepositoryImpl.saveData` creates a new `BlobClient` for every single upload operation. This prevents connection reuse and increases the overhead of establishing connections to Azure.
 
-**File:** `src/main/java/com/aa/fso/repository/AzureBlobRepositoryImpl.java`
-**Lines:** [L15-L25] (approximate based on snippet)
+*   **File:** `src/main/java/com/aa/fso/repository/AzureBlobRepositoryImpl.java`
+*   **Lines:** `L15-L25`
+*   **Snippet:**
+    ```java
+    public boolean saveData(...) {
+        // ...
+        try (ByteArrayInputStream dataStream = new ByteArrayInputStream(dataBytes)) {
+            // NEW CLIENT CREATED EVERY TIME
+            BlobClient blobClient = currentEnvClientBuilder.blobName(...).buildClient();
+            blobClient.upload(dataStream, dataBytes.length, true);
+        }
+        // ...
+    }
+    ```
 
-```java
-try (ByteArrayInputStream dataStream = new ByteArrayInputStream(dataBytes)) {
-    BlobClient blobClient = currentEnvClientBuilder.blobName(folderName + "/" + fileName + fileExtension).buildClient();
-    blobClient.upload(dataStream, dataBytes.length, true);
-    // blobClient is not explicitly closed, though it might be disposable
-}
-```
-
-**Recommendation:** Ensure `BlobClient` implements `AutoCloseable` (it does in newer SDKs) and wrap it in `try-with-resources`, or better yet, reuse a singleton `BlobContainerClient` and create `BlobClient` instances only for specific blobs if necessary, or rely on the SDK's internal pooling if available.
+**Recommendation:** Instantiate `BlobClient` once (e.g., in the constructor or as a singleton) and reuse it, or use `BlobContainerClient` to create clients efficiently.
 
 ---
 
@@ -177,24 +193,29 @@ try (ByteArrayInputStream dataStream = new ByteArrayInputStream(dataBytes)) {
 
 ### Immediate Actions (P0)
 1.  **Fix Resource Leaks:** Refactor `LegDataRepositoryImpl.connectToFOS` to ensure `HttpURLConnection.disconnect()` is called in a `finally` block.
-2.  **Native Cleanup:** Add a `close()` method to `OptModel` that calls `model.close()` (or equivalent FICO API) and invoke it in `SolverService.runSolver` within a `finally` block.
-3.  **Reduce GC Pressure:** Refactor `identifyDhdFromBase` to avoid `deepCopy` inside the innermost loop. Consider passing a "modification context" to the validation logic instead of cloning the whole object.
+    ```java
+    HttpURLConnection conn = null;
+    try {
+        // ... setup
+        conn = (HttpURLConnection) url.openConnection();
+        // ...
+    } finally {
+        if (conn != null) conn.disconnect();
+    }
+    ```
+2.  **Native Cleanup:** Add a `close()` method to `OptModel` that calls the FICO Xpress native cleanup functions. Ensure `OptimizationServiceImpl.optimize` wraps the `optModel` usage in a `try-finally` block to call `optModel.close()`.
+3.  **Stop Object Churn:** Refactor `identifyDhdFromBase` and `identifyDhdToBase`. Instead of `new UnsequencedLegPairing(pairing)` and `deepCopy`, create a single reusable `tempPairing` instance and manually revert changes after the legality check, or pass a "copy-on-write" flag to the validation logic.
 
 ### Short Term (P1)
-4.  **Refactor Date Calculation:** Replace `FSOUtil.daysBetween` with `ChronoUnit.DAYS.between`.
-5.  **Immutable Validation:** Refactor `PilotRedeyeRule` and similar classes to return a `ValidationResult` object instead of mutating the `UnsequencedLegPairing`.
-6.  **Azure Client Management:** Ensure `BlobClient` is properly disposed of or refactor to use a reusable `BlobContainerClient` pattern.
+4.  **Fix Date Calculation:** Replace `FSOUtil.daysBetween` with `ChronoUnit.DAYS.between`.
+5.  **Azure Client Reuse:** Move `BlobClient` instantiation out of the `saveData` method. Cache the client in the repository class.
+6.  **Validation Isolation:** Refactor `PilotRedeyeRule` and similar classes to return a result object (e.g., `ValidationResult`) instead of mutating the `UnsequencedLegPairing`. This ensures thread safety if the solver runs in parallel threads.
 
 ### Long Term (P2)
-7.  **State Management:** If this code is part of a larger streaming pipeline (Flink), ensure state descriptors are configured with `enableTimeToLive()` to prevent state bloat.
-8.  **Connection Pooling:** Replace raw `HttpURLConnection` usage with `HttpClient` (Java 11+) or Apache HttpClient which supports connection pooling natively.
-9.  **Monitoring:** Add metrics for:
-    *   Native memory usage (via JMX or native hooks).
-    *   GC pause times.
-    *   Number of `HttpURLConnection` creations vs. successful completions.
-    *   Number of `OptModel` instantiations.
+7.  **State Management:** If this application is eventually migrated to Flink or a similar streaming engine, ensure all `StateDescriptor` usage includes `enableTimeToLive()` to prevent state bloat.
+8.  **Profiling:** Implement JFR (Java Flight Recorder) or async-profiler in the staging environment to capture GC logs and CPU profiles. Verify if the `deepCopy` operations are indeed the primary cause of GC pressure.
+9.  **Connection Pooling:** If `connectToFOS` is called frequently, consider using Apache HttpClient or OkHttp with a connection pool instead of `HttpURLConnection`.
 
-### Configuration Recommendations
-*   **JVM Flags:** Increase `-XX:+UseG1GC` and tune `-XX:MaxGCPauseMillis` to handle the high allocation churn identified.
-*   **Kubernetes Resources:** Based on the audit, the current 32Gi/8CPU (nonprod) or 64Gi/8CPU (prod) limits seem appropriate given the heavy computation, but ensure `memoryRequest` is set high enough to avoid OOMKills during peak GC events.
-*   **Timeouts:** Set explicit timeouts on `HttpURLConnection` and Azure SDK calls to prevent hanging threads.
+### Configuration Review
+*   **Kubernetes Resources:** The `k8s/IT/eastus-qa/kustomization.yaml` sets memory limits to `64G`. Given the identified memory leaks (Native + Java Churn), ensure the JVM Heap is tuned (`-Xmx`) to be slightly less than the container limit (e.g., 50G) to leave room for native memory and off-heap buffers.
+*   **Timeouts:** Ensure `HttpURLConnection` timeouts are explicitly set to prevent hanging threads if the FOS service is slow.
