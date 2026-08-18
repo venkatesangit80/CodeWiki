@@ -16,19 +16,18 @@ sequenceDiagram
 ### Execution Trace Narration: Debug Solver Endpoint
 
 **Overview**
-The execution begins at the entry point `HttpSolverController.solveDebug`, located in `src/main/java/com/aa/fso/controller/HttpSolverController.java`. This endpoint serves as a manual trigger for the solver engine, allowing developers or operators to submit a `UserInput` payload directly via HTTP POST to the `/solveDebug` route. The operation is designed to mirror the logic of the standard event-driven solver execution.
+The execution begins at the entry point `HttpSolverController.solveDebug`, located in `src/main/java/com/aa/fso/controller/HttpSolverController.java`. This endpoint is designed to trigger the solver logic using manually provided `UserInput` data, simulating the behavior of an event-driven solver invocation. The method is mapped to the POST path `/solveDebug` and returns a list of solution objects wrapped in an HTTP 200 OK response.
 
 **Execution Path and Data Flow**
-Upon receiving the request, the controller extracts the `UserInput` object from the request body. The control flow immediately delegates the core computational logic to the `solverService` by invoking the `solve` method. This service layer processes the input against the configured solver algorithms to generate a `SolverResponseDTO`.
+Upon receiving a request, the controller extracts the `UserInput` object from the request body. The control flow immediately enters a `try` block to ensure robust error handling and resource cleanup. Inside this block, the primary business logic is delegated to `solverService.solve(userInput)` on line 14. This service call processes the input data, executes the solver algorithm, and constructs a `SolverResponseDTO` containing the results.
 
-Inside the `try` block, the controller retrieves the specific solution set from the response object using `solverResponse.getSolutions()`. This collection of `OutputData` objects represents the computed results intended for the client. The method then constructs and returns an HTTP 200 OK response containing this list of solutions.
+Following the successful service invocation, the controller extracts the specific solution data by calling `solverResponse.getSolutions()` on line 15. This list of `OutputData` objects is then returned as the payload of a `ResponseEntity` with a status code of 200 (OK). A commented-out line 16 indicates an alternative implementation path for local JSON file testing, which is currently inactive.
 
-**Conditionals and Error Handling**
-The implementation utilizes a `try-finally` structure to ensure resource cleanup regardless of the outcome. While the provided snippet does not explicitly show a `catch` block, the `finally` block guarantees that the state management system is reset after the request processing completes. This ensures that any transient run states held by the application are cleared, preventing state leakage between sequential requests.
+**State Management and Cleanup**
+Crucially, the method utilizes a `finally` block spanning lines 17–19. Regardless of whether the solver execution succeeds or throws an exception, the code within this block is guaranteed to execute. Specifically, `runStateManager.clearRun()` is invoked to reset the internal state of the current solver run. This ensures that no residual state persists between sequential debug requests, maintaining system integrity.
 
-**Final Return Output**
-The method concludes by returning a `ResponseEntity` wrapping the list of `OutputData` objects. If the solver executes successfully, the client receives the calculated solutions. Concurrently, the `runStateManager.clearRun()` method is invoked within the `finally` block to sanitize the internal state.
+**Final Output**
+The function concludes by returning a `ResponseEntity<List<OutputData>>`. If the solver executes successfully, the response body contains the list of generated solutions. If an exception occurs during the service call, the exception propagates up to the global exception handler (implied by standard Spring Boot architecture), while the `finally` block still executes to clear the run state before the error response is sent.
 
-**Code Reference**
-The critical logic described above is defined in the following section of the source code:
-[src/main/java/com/aa/fso/controller/HttpSolverController.java:14-28]
+**Relevant Code Reference**
+[src/main/java/com/aa/fso/controller/HttpSolverController.java:10-25]
