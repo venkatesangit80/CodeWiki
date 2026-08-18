@@ -1,0 +1,39 @@
+analysis:
+  call_graph_traversal_depth: 5
+  ignore_paths:
+  - .git
+  - node_modules
+  - dist
+  - build
+  - __pycache__
+  - venv
+  - target
+  - .mvn
+  - src/test
+  module_granularity: directory
+embedding:
+  endpoint: http://localhost:11434/v1
+  model: nomic-embed-text
+  provider: ollama
+github:
+  auth_token_env: GITHUB_PAT
+llm:
+  context_window_tokens: 128000
+  endpoint: nats://ec2-54-191-170-106.us-west-2.compute.amazonaws.com:4222
+  model: qwen2.5-coder:7b
+  provider: nats
+  nats_user: js_everyops
+  nats_password: 8BcUaUYxOnVG8g1T
+  temperature: 0.2
+output:
+  formats:
+  - markdown
+  output_dir: /Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/docs/codedoc
+repos:
+- branch: main
+  local_path: /Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25
+  repo_id: fsoft-ai4code/sequence-builder
+  tech: solver
+vector_store:
+  backend: sqlite
+  path: /Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/.codedoc/vector_store

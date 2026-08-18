@@ -36,9 +36,18 @@ class GeneratorOrchestrator:
         parts = os.path.dirname(file_path).split(os.sep)
         if "java" in parts:
             java_idx = parts.index("java")
-            pkg = ".".join(parts[java_idx+1:])
+            pkg_parts = parts[java_idx+1:]
+            # Roll up deep package namespaces to max 4 levels to keep diagrams clean and professional
+            if len(pkg_parts) > 4:
+                pkg_parts = pkg_parts[:4]
+            pkg = ".".join(pkg_parts)
             return pkg if pkg else "default_package"
-        return os.path.dirname(file_path) if os.path.dirname(file_path) else "root"
+        
+        # For non-Java (Python, TS, Go), roll up deeply nested directories to max 3 levels
+        dir_parts = [p for p in parts if p and p != "."]
+        if len(dir_parts) > 3:
+            dir_parts = dir_parts[:3]
+        return "/".join(dir_parts) if dir_parts else "root"
 
     async def generate_hldd(self) -> Dict[str, str]:
         """Runs HLDD generation pass. Uses LLM if configured; otherwise runs programmatic fallback."""
