@@ -1,79 +1,84 @@
 # 1. Executive Summary & System Context
 
 ## 1.1 Overview
-The **Sequence Builder** (`fsoft-ai4code/sequence-builder`) is a high-throughput, event-driven Java application designed to automate the generation and validation of flight crew pairings and duty sequences. Built upon the Spring Boot framework, the system orchestrates complex scheduling algorithms, enforces regulatory compliance (e.g., FAR 117), and manages stateful execution contexts across distributed environments.
+The **Sequence Builder** (`fsoft-ai4code/sequence-builder`) is a high-performance, domain-specific optimization engine designed to automate the sequencing of flight legs and crew assignments within complex aviation operational constraints. Built upon the Spring Boot framework, the system orchestrates a multi-stage solving process that ingests unsequenced flight data, applies regulatory rules (e.g., FAR 117), and generates optimized crew pairings. The system supports both synchronous HTTP interactions for debugging and asynchronous event-driven processing via Apache Kafka, ensuring scalability for production workloads.
 
-The codebase comprises **195 files**, containing **196 classes** and **710 methods**. The architecture prioritizes modularity through a clear separation of concerns: RESTful API exposure, asynchronous event processing via Apache Kafka, and domain-specific logic encapsulated within service layers and rule engines.
+The codebase represents a mature, modular monolith comprising **195 files**, **196 classes**, and **710 methods**. It leverages a strict separation of concerns between data modeling, business logic (rules), and infrastructure concerns (persistence, messaging).
 
 ## 1.2 Repository Architecture
-The project follows a standard Maven-based monolithic structure with a layered architecture pattern. The core logic resides in `src/main/java/com/aa/fso`, organized into distinct packages:
+The repository follows a standard Spring Boot layered architecture, organized by functional domains rather than technical layers. This structure facilitates the maintenance of complex rule sets and domain entities.
 
-*   **Entry Points & Controllers**: Exposes HTTP endpoints for manual debugging, status monitoring, and data retrieval.
-*   **Services**: Orchestrates business logic, including solver execution, state management, and external data integration.
-*   **Models & DTOs**: Defines the schema for user inputs, solver outputs, and internal domain entities.
-*   **Infrastructure**: Handles Kafka consumption/production, Azure Blob storage, and database repositories.
+### Core Structural Components
+*   **Domain Models**: Centralized definitions of aviation entities such as `FlightLeg`, `DutyInfo`, and `UserInput`. These are defined in `src/main/java/com/aa/fso/model/` and serve as the contract between the API layer and the solver engine.
+*   **Rules Engine**: A dedicated package for regulatory compliance checks, including `FAR117FTRule` and `ThreeAMHBT`, ensuring generated sequences adhere to legal standards.
+*   **Services**: The core orchestration logic resides in `SolverService` and `OptimizationService`, which manage the state of the solving process and interact with external data sources.
+*   **Persistence**: Data access is abstracted via repositories like `LegDataRepository` and `OutputDataRepository`, utilizing implementations such as `LegDataRepositoryImpl` for complex query logic.
 
-### Core File Distribution
-The system's functionality is anchored by several critical components identified in the codebase analysis:
-*   **Application Bootstrap**: [`SequenceBuilderApplication.java`](src/main/java/com/aa/fso/SequenceBuilderApplication.java) initializes the Spring context and enables scheduling capabilities.
-*   **Solver Orchestration**: [`SolverService`](src/main/java/com/aa/fso/service/SolverService.java) (implied usage) drives the core sequencing logic, invoked via both synchronous HTTP requests and asynchronous Kafka events.
-*   **State Management**: [`RunStateManager`](src/main/java/com/aa/fso/service/RunStateManager.java) ensures thread-safe handling of active solver runs and supports graceful termination.
-*   **Domain Rules**: Compliance logic is isolated in modules like [`FAR117RestTimeRule.java`](src/main/java/com/aa/fso/rules/FAR117RestTimeRule.java) and [`ConstructNetwork.java`](src/main/java/com/aa/fso/processor/ConstructNetwork.java).
+### Key File Metrics & Entry Points
+The system's execution flow is initiated through three distinct entry points, catering to different operational modes:
 
-## 1.3 System Context & Entry Points
-The system accepts input through two primary channels: **Synchronous HTTP APIs** for operational control and **Asynchronous Kafka Events** for bulk processing.
+#### 1. Application Bootstrap
+The primary entry point initializes the Spring context, enabling scheduling and auto-configuration.
+*   **Location**: `src/main/java/com/aa/fso/SequenceBuilderApplication.java`
+*   **Method**: `SequenceBuilderApplication.main` ([SequenceBuilderApplication.java:L12-16])
+*   **Function**: Bootstraps the application using `SpringApplication.run`, activating the `@EnableScheduling` annotation to support background tasks.
 
-### 1.3.1 Synchronous HTTP Entry Points
-These endpoints allow operators to trigger solver runs, inspect system health, and retrieve raw flight data.
+#### 2. Synchronous HTTP Interface
+Provides a direct API for manual testing and debugging, allowing users to submit `UserInput` and receive immediate `OutputData`.
+*   **Location**: `src/main/java/com/aa/fso/controller/HttpSolverController.java`
+*   **Method**: `HttpSolverController.solveDebug` ([HttpSolverController.java:L44-58])
+*   **Logic**: Accepts a `UserInput` payload, invokes `solverService.solve`, and returns a list of `OutputData`. It includes a `finally` block to ensure `runStateManager.clearRun()` is executed, preventing state leakage between requests.
+*   **Timeout**: Configured to timeout after 2 minutes in cloud environments.
 
-| Endpoint | Method | Controller | Description |
-| :--- | :--- | :--- | :--- |
-| `/solveDebug` | `POST` | [`HttpSolverController`](src/main/java/com/aa/fso/controller/HttpSolverController.java) | Triggers the solver with a provided `UserInput`. Includes a 2-minute timeout mechanism and automatic state cleanup. |
-| `/run/status` | `GET` | [`KillController`](src/main/java/com/aa/fso/controller/KillController.java) | Returns the current active `SnapshotID` and kill request status. |
-| `/openLegs` | `GET` | [`FlightController`](src/main/java/com/aa/fso/controller/FlightController.java) | Retrieves unsequenced flight legs based on date ranges, positions, and equipment types. |
-| `/azure/blob` | `POST/GET` | [`AzureBlobController`](src/main/java/com/aa/fso/controller/AzureBlobController.java) | Manages persistence of large datasets to Azure Blob Storage. |
+#### 3. Asynchronous Event Processing
+The primary production path, consuming messages from a Kafka topic to trigger the solver pipeline.
+*   **Location**: `src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java`
+*   **Method**: `KafkaConsumerService.consumeMessage` ([KafkaConsumerService.java:L42-86])
+*   **Logic**:
+    1.  Deserializes incoming JSON into `UserInput`.
+    2.  Validates the presence of `SnapshotIds`.
+    3.  Invokes `solverService.solve` to generate solutions.
+    4.  Compresses the resulting solutions using `CompressUtil.compressJsonObjects`.
+    5.  Publishes the compressed binary response via `KafkaProducerService`.
+    6.  Handles `KillRunException` gracefully, triggering notifications via `TeamsNotification`.
 
-**Implementation Detail**: The primary solver entry point [`HttpSolverController.solveDebug`](src/main/java/com/aa/fso/controller/HttpSolverController.java:L44-58) demonstrates the system's reliance on dependency injection. It instantiates a `SolverResponseDTO` via `solverService.solve()` and ensures resource hygiene by invoking `runStateManager.clearRun()` in a `finally` block.
+#### 4. Operational Control
+A dedicated endpoint for monitoring and controlling long-running solver instances.
+*   **Location**: `src/main/java/com/aa/fso/controller/KillController.java`
+*   **Method**: `KillController.getRunStatus` ([KillController.java:L53-65])
+*   **Function**: Exposes the current `SnapshotId` and kill request status via `runStateManager`, allowing operators to verify the health of active runs.
 
-### 1.3.2 Asynchronous Kafka Entry Point
-The system acts as a consumer for high-volume sequencing jobs via Apache Kafka.
+#### 5. Data Retrieval
+Provides read-only access to flight data required for analysis.
+*   **Location**: `src/main/java/com/aa/fso/controller/FlightController.java`
+*   **Method**: `FlightController.getOpenLegs` ([FlightController.java:L23-30])
+*   **Function**: Queries `LegDataRepository` to retrieve `UnsequencedLeg` objects based on date ranges, positions, and equipment types.
 
-*   **Topic**: Configured via `${solver.topic.name}`.
-*   **Consumer Group**: `${kafka.consumer.group.id.dcr.cwr}`.
-*   **Concurrency**: Configurable via `${sb.consumer.topics.concurrency}`.
+## 1.3 Critical Domain Artifacts
+The following files represent the backbone of the system's data integrity and business logic:
 
-The core consumer logic resides in [`KafkaConsumerService.consumeMessage`](src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java:L42-86). This method:
-1.  Deserializes incoming JSON payloads into `UserInput` objects.
-2.  Validates the presence of `SnapshotIds`.
-3.  Invokes the solver engine.
-4.  Compresses the resulting solutions using [`CompressUtil`](src/main/java/com/aa/fso/util/CompressUtil.java) before publishing them back to the response topic.
-5.  Handles specific exceptions like `KillRunException` to trigger notifications via [`TeamsNotification`](src/main/java/com/aa/fso/component/TeamsNotification.java).
+| Category | File Path | Significance |
+| :--- | :--- | :--- |
+| **Model** | `src/main/java/com/aa/fso/model/ITFlightKey.java` | Defines the unique identifier for flight itineraries. |
+| **Model** | `src/main/java/com/aa/fso/model/FlightLeg.java` | Core entity representing a single flight segment. |
+| **Model** | `src/main/java/com/aa/fso/model/UserInput.java` | The primary DTO for solver configuration and parameters. |
+| **DTO** | `src/main/java/com/aa/fso/dto/SolverResponseDTO.java` | Encapsulates the output of the solving algorithm. |
+| **Rules** | `src/main/java/com/aa/fso/rules/FAR117FTRule.java` | Implements Federal Aviation Regulation 117 compliance checks. |
+| **Rules** | `src/main/java/com/aa/fso/contractualrules/ThreeAMHBT.java` | Enforces specific contractual time-based constraints. |
+| **Mapper** | `src/main/java/com/aa/fso/mapper/QLAMapper.java` | Transforms internal models to QLA (Quality Assurance) format. |
+| **Repo** | `src/main/java/com/aa/fso/repository/LegDataRepositoryImpl.java` | Custom implementation for complex leg data queries. |
+| **Config** | `src/main/java/com/aa/fso/config/AzureBlobStorageConfiguration.java` | Manages integration with Azure Blob Storage for persistent data. |
+| **Exception** | `src/main/java/com/aa/fso/exception/SolverExceptionHandler.java` | Global exception handling strategy for solver failures. |
 
-## 1.4 Key Architectural Components
+## 1.4 System Context Diagram
+The Sequence Builder operates within a broader ecosystem:
+1.  **Ingestion**: Receives raw flight data via `FlightController` or pre-processed events via `KafkaConsumerService`.
+2.  **Processing**: The `SolverService` orchestrates the application of `FAR117FTRule` and other constraints against `UserInput`.
+3.  **State Management**: `RunStateManager` tracks the lifecycle of a specific solve job, managing snapshots and kill signals.
+4.  **Output**: Results are either returned synchronously via `HttpSolverController` or published asynchronously as compressed blobs via `KafkaProducerService`.
+5.  **External Dependencies**: Integrates with Azure Blob Storage for persistence and Teams for alerting.
 
-### 1.4.1 State Management & Concurrency
-To support concurrent solver executions, the system utilizes a centralized state manager. The [`RunStateManager`](src/main/java/com/aa/fso/service/RunStateManager.java) tracks the `CurrentSnapshotId` and flags for kill requests. This is critical for the [`KillController.getRunStatus`](src/main/java/com/aa/fso/controller/KillController.java:L53-65) endpoint, which provides real-time visibility into long-running processes.
-
-### 1.4.2 Data Persistence & Retrieval
-The system integrates with external storage and databases:
-*   **Flight Data**: Retrieved via [`LegDataRepository`](src/main/java/com/aa/fso/repository/LegDataRepository.java) (used in [`FlightController`](src/main/java/com/aa/fso/controller/FlightController.java)).
-*   **Input Data**: Managed by [`InputDataRepositoryImpl`](src/main/java/com/aa/fso/repository/InputDataRepositoryImpl.java).
-*   **Blob Storage**: Handled by [`AzureBlobRepositoryImpl`](src/main/java/com/aa/fso/repository/AzureBlobRepositoryImpl.java) for large-scale data archiving.
-
-### 1.4.3 Domain Logic & Validation
-Complex business rules are implemented as discrete components:
-*   **Regulatory Compliance**: [`FAR117RestTimeRule.java`](src/main/java/com/aa/fso/rules/FAR117RestTimeRule.java) enforces FAA rest time regulations.
-*   **Network Construction**: [`ConstructNetwork.java`](src/main/java/com/aa/fso/processor/ConstructNetwork.java) builds the graph representation of flight legs for the solver.
-*   **Input Validation**: [`InputValidationProcessor`](src/main/java/com/aa/fso/processor/InputValidationProcessor.java) sanitizes and validates incoming payloads before processing.
-
-## 1.5 Technology Stack Summary
-*   **Language**: Java (Standard Edition)
-*   **Framework**: Spring Boot (Web, Kafka, Actuator)
-*   **Messaging**: Apache Kafka
-*   **Storage**: Azure Blob Storage, Relational Database (via JPA/Hibernate implied by Repositories)
-*   **Utilities**: Lombok (for boilerplate reduction), Jackson (JSON serialization), SLF4J/Logback (Logging)
-
-This architecture ensures that the Sequence Builder can handle both interactive debugging scenarios and high-volume, automated production workloads with robust error handling and state consistency.
+This architecture ensures that the heavy computational load of the solver is isolated from the web server thread pool, while maintaining strict consistency through the `RunStateManager` and robust error handling via `SolverExceptionHandler`.
 
 ## Architecture Diagram
 
@@ -162,141 +167,137 @@ flowchart TD
 
 # 2. Component Inventory & Core Module Responsibilities
 
-## 2.1 Architectural Overview
-The `sequence-builder` application is a Spring Boot-based microservice designed to orchestrate flight sequence generation, legality checking (FAR 117 compliance), and data ingestion via both HTTP and asynchronous Kafka streams. The system operates on a modular architecture separating concerns into **Ingestion**, **Orchestration**, **Business Logic**, and **Persistence** layers.
+This section details the architectural decomposition of the `sequence-builder` application, mapping the 195 files and 196 classes to their functional responsibilities. The system follows a layered architecture pattern, separating concerns between HTTP entry points, asynchronous event processing, domain logic, and data persistence.
 
-The codebase comprises **195 files**, **196 classes**, and **710 methods**, indicating a moderate complexity level with a strong emphasis on domain-specific logic for aviation scheduling. The entry points identified confirm a dual-mode execution strategy: synchronous REST API handling for debugging and ad-hoc requests, and asynchronous event-driven processing for production workloads via Azure Event Hubs/Kafka.
+## 2.1 Entry Point Analysis
 
-## 2.2 Directory Structure & File Mappings
+The application exposes two distinct execution pathways: synchronous RESTful interactions for debugging and monitoring, and asynchronous event-driven processing for production workloads.
 
-The repository follows a standard Maven/Gradle Java structure, organized by functional domains. Key directories and their primary responsibilities are mapped below:
+### 2.1.1 Application Bootstrap
+The primary entry point initializes the Spring Boot context with scheduling capabilities enabled.
+*   **Component**: `SequenceBuilderApplication`
+*   **Location**: `src/main/java/com/aa/fso/SequenceBuilderApplication.java`
+*   **Responsibility**: Orchestrates the application lifecycle, enabling `@EnableScheduling` for periodic tasks and configuring the root package scan.
+*   **Code Reference**: [`SequenceBuilderApplication.main`](src/main/java/com/aa/fso/SequenceBuilderApplication.java:L12-16) invokes `SpringApplication.run`, establishing the context for all downstream beans.
 
-### 2.2.1 Application Entry & Configuration
-*   **Primary Entry Point**: `SequenceBuilderApplication` initializes the Spring context and enables scheduled tasks.
-    *   **File**: [`src/main/java/com/aa/fso/SequenceBuilderApplication.java`](src/main/java/com/aa/fso/SequenceBuilderApplication.java)
-    *   **Responsibility**: Bootstraps the application, enabling `@EnableScheduling` for periodic background jobs.
-    *   **Metrics**: Lines 12-16; imports `SpringApplication`, `Slf4j`.
+### 2.1.2 Synchronous HTTP Endpoints
+These controllers handle direct user requests, primarily for debugging, status monitoring, and data retrieval.
 
-### 2.2.2 Controller Layer (Ingestion & Exposure)
-This layer exposes REST endpoints for external systems and provides debug capabilities. It acts as the facade for the Service layer.
+| Controller | Method | Responsibility | Key Dependencies |
+| :--- | :--- | :--- | : |
+| **HttpSolverController** | `solveDebug` | Accepts `UserInput` via POST, delegates to `SolverService`, and returns immediate results. Includes cleanup logic in a `finally` block. | `SolverService`, `RunStateManager` |
+| **KillController** | `getRunStatus` | Exposes `/run/status` to query the current execution state, specifically checking for active snapshot IDs and kill flags. | `RunStateManager` |
+| **FlightController** | `getOpenLegs` | Queries unsequenced flight legs based on date ranges and equipment constraints. | `LegDataRepository` |
 
-| Controller Class | Primary Responsibility | Key Methods | File Path |
-| :--- | :--- | :--- | :--- |
-| **HttpSolverController** | Handles synchronous solving requests. Supports manual `UserInput` submission and triggers the solver engine. | `solveDebug` | [`src/main/java/com/aa/fso/controller/HttpSolverController.java`](src/main/java/com/aa/fso/controller/HttpSolverController.java) |
-| **FlightController** | Manages flight data retrieval, specifically querying open legs based on date ranges and equipment types. | `getOpenLegs` | [`src/main/java/com/aa/fso/controller/FlightController.java`](src/main/java/com/aa/fso/controller/FlightController.java) |
-| **KillController** | Provides operational control over active solver runs, allowing status checks and kill signal propagation. | `getRunStatus` | [`src/main/java/com/aa/fso/controller/KillController.java`](src/main/java/com/aa/fso/controller/KillController.java) |
-| **AzureBlobController** | (Implied) Manages interactions with Azure Blob Storage for persistent data artifacts. | N/A | [`src/main/java/com/aa/fso/controller/AzureBlobController.java`](src/main/java/com/aa/fso/controller/AzureBlobController.java) |
+*   **Critical Logic**: The `solveDebug` method ([`HttpSolverController.solveDebug`](src/main/java/com/aa/fso/controller/HttpSolverController.java:L44-58)) demonstrates a tight coupling between the controller and the service layer, ensuring `RunStateManager` is cleared regardless of success or failure.
 
-**Detailed Analysis of `HttpSolverController.solveDebug`:**
-*   **Logic**: Accepts a `UserInput` DTO, delegates to `SolverService`, and returns a list of `OutputData`.
-*   **State Management**: Utilizes `RunStateManager` in a `finally` block to ensure cleanup (`clearRun`) regardless of success or failure.
-*   **Timeout Handling**: Designed for local debugging (Postman) but includes logic to handle cloud timeouts (2-minute limit).
-*   **Reference**: [`src/main/java/com/aa/fso/controller/HttpSolverController.java:L44-58`](src/main/java/com/aa/fso/controller/HttpSolverController.java)
+### 2.1.3 Asynchronous Event Processing
+The core solver logic is triggered via Kafka, decoupling the ingestion of requests from the heavy computation.
 
-### 2.2.3 Service Layer (Orchestration & Business Logic)
-The service layer contains the core business logic, including the solver engine, state management, and data transformation.
+*   **Component**: `KafkaConsumerService`
+*   **Location**: `src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java`
+*   **Responsibility**:
+    1.  Consumes messages from the configured topic (`${solver.topic.name}`).
+    2.  Deserializes JSON payloads into `UserInput` objects.
+    3.  Validates mandatory fields (e.g., `SnapshotIds`).
+    4.  Invokes `SolverService.solve`.
+    5.  Compresses the resulting solutions using `CompressUtil`.
+    6.  Publishes the compressed binary payload back to Kafka via `KafkaProducerService`.
+    7.  Handles specific exceptions like `KillRunException` to trigger Teams notifications.
+*   **Code Reference**: [`KafkaConsumerService.consumeMessage`](src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java:L42-86) manages the full transactional flow, including acknowledgment (`ack.acknowledge`) and resource cleanup.
+
+## 2.2 Core Domain Modules
+
+The following modules represent the critical business logic and data structures within the 710-method codebase.
+
+### 2.2.1 Data Models & DTOs
+These classes define the contract between layers and the internal representation of aviation scheduling entities.
+
+*   **Input/Output Contracts**:
+    *   [`UserInput`](src/main/java/com/aa/fso/model/UserInput.java): Encapsulates solver parameters, including snapshot IDs and crew constraints.
+    *   [`SolverResponseDTO`](src/main/java/com/aa/fso/dto/SolverResponseDTO.java): Aggregates the list of generated solutions for transmission.
+    *   [`OutputData`](src/main/java/com/aa/fso/model/OutputData.java): Represents individual solution instances returned by the solver.
+*   **Aviation Entities**:
+    *   [`FlightLeg`](src/main/java/com/aa/fso/model/FlightLeg.java) / [`UnsequencedLeg`](src/main/java/com/aa/fso/model/UnsequencedLeg.java): Core entities representing flight segments.
+    *   [`DutyInfo`](src/main/java/com/aa/fso/model/DutyInfo.java): Captures duty period details for crew scheduling.
+    *   [`ITFlightKey`](src/main/java/com/aa/fso/model/ITFlightKey.java): Unique identifier logic for flight tracking.
+    *   [`Network`](src/main/java/com/aa/fso/model/Network.java): Likely represents the graph structure used for sequence optimization.
+
+### 2.2.2 Rule Engine & Validation
+The system enforces regulatory compliance (e.g., FAR 117) and business rules before and during sequence generation.
+
+*   **Regulatory Rules**:
+    *   [`FAR117FTRule`](src/main/java/com/aa/fso/rules/FAR117FTRule.java): Implements Federal Aviation Regulations for flight time limitations.
+    *   [`ThreeAMHBT`](src/main/java/com/aa/fso/contractualrules/ThreeAMHBT.java): Specific contractual rule implementation.
+*   **Validation Logic**:
+    *   [`LegalityRuleResult`](src/main/java/com/aa/fso/qlacheck/response/LegalityRuleResult.java): Standardized response object for rule validation outcomes.
+    *   [`QLAMapper`](src/main/java/com/aa/fso/mapper/QLAMapper.java): Maps internal model states to QLA (Quality Assurance) check formats.
+
+### 2.2.3 Service Layer
+The service layer acts as the orchestration hub, managing state and delegating to repositories or external services.
 
 *   **Solver Orchestration**:
-    *   **Class**: `SolverService` (Referenced in `HttpSolverController` and `KafkaConsumerService`).
-    *   **Responsibility**: Executes the core algorithm to generate sequences. It supports both direct execution and file-based execution (`solveWithLocalJsonFile`).
-    *   **Dependency**: Relies heavily on `RunStateManager` to track execution context.
-
+    *   `SolverService`: The central brain that executes the sequencing algorithm. It is called by both the HTTP controller and the Kafka consumer.
 *   **State Management**:
-    *   **Class**: `RunStateManager`
-    *   **Responsibility**: Maintains the lifecycle of a solver run, tracking the current `snapshotId` and managing kill flags.
-    *   **Usage**: Called by `KillController.getRunStatus` to report active run IDs and kill status.
-    *   **Reference**: [`src/main/java/com/aa/fso/controller/KillController.java:L53-65`](src/main/java/com/aa/fso/controller/KillController.java)
+    *   `RunStateManager`: Maintains the lifecycle state of a solver run, tracking the `currentSnapshotId` and handling graceful termination requests (`isKillRequested`).
+*   **Optimization**:
+    *   `OptimizationService`: Likely contains the heuristic or exact algorithms for generating valid sequences.
 
-*   **Data Access & Processing**:
-    *   **Class**: `ITDataServiceImpl` / `InputDataRepositoryImpl`
-    *   **Responsibility**: Implements repository patterns for fetching raw flight and duty data.
-    *   **File**: [`src/main/java/com/aa/fso/service/ITDataServiceImpl.java`](src/main/java/com/aa/fso/service/ITDataServiceImpl.java)
+### 2.2.4 Data Access & Infrastructure
+*   **Repositories**:
+    *   `LegDataRepository` / `LegDataRepositoryImpl`: Handles persistence and retrieval of flight leg data.
+    *   `OutputDataRepository`: Manages storage of generated solver outputs.
+    *   `AccessTokenClientImpl`: Manages authentication tokens for external integrations.
+*   **Utilities**:
+    *   `CompressUtil`: Handles JSON compression for efficient Kafka messaging.
+    *   `FSOUtil`: General utility functions for Flight Schedule Operations.
+    *   `TeamsNotification`: Facilitates alerting via Microsoft Teams upon critical events (e.g., run kills).
 
-*   **Pairing Generation**:
-    *   **Class**: `PairingGenerationServiceImpl`
-    *   **Responsibility**: Likely handles the specific logic for generating crew pairings based on sequenced legs.
-    *   **File**: [`src/main/java/com/aa/fso/service/PairingGenerationServiceImpl.java`](src/main/java/com/aa/fso/service/PairingGenerationServiceImpl.java)
+## 2.3 Exception Handling Strategy
+The application employs a centralized exception handling mechanism to ensure consistent error responses across both HTTP and Kafka pathways.
 
-### 2.2.4 Asynchronous Ingestion (Kafka)
-The system utilizes Apache Kafka for high-throughput, decoupled processing of solver requests.
+*   **Component**: `SolverExceptionHandler`
+*   **Location**: `src/main/java/com/aa/fso/exception/SolverExceptionHandler.java`
+*   **Responsibility**: Catches domain-specific exceptions such as `InvalidUserInputException` and `KillRunException`, translating them into appropriate HTTP status codes or logging them for downstream processing.
 
-*   **Consumer Service**:
-    *   **Class**: `KafkaConsumerService`
-    *   **Entry Point**: `consumeMessage`
-    *   **File**: [`src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java`](src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java)
-    *   **Logic Flow**:
-        1.  Listens to `${solver.topic.name}`.
-        2.  Deserializes JSON payload into `UserInput`.
-        3.  Validates `SnapshotIds`; throws `InvalidUserInputException` if missing.
-        4.  Invokes `solverService.solve`.
-        5.  Compresses results using `CompressUtil`.
-        6.  Publishes compressed binary response via `KafkaProducerService`.
-        7.  Handles `KillRunException` by sending notifications via `TeamsNotification`.
-    *   **Metrics**: Lines 42-86; handles `JsonProcessingException` and `KillRunException` explicitly.
+## 2.4 Directory & File Mapping Summary
 
-### 2.2.5 Domain Models & Data Structures
-The application relies on a rich set of domain objects representing flight schedules, legality rules, and network graphs.
+The following table maps the provided core file list to their architectural roles:
 
-*   **Core Models**:
-    *   `UserInput`: Input payload for solver requests.
-    *   `OutputData` / `SolverResponseDTO`: Structured output containing generated sequences.
-    *   `FlightKey` / `ITFlightKey`: Unique identifiers for flight segments.
-    *   `Node`: Represents graph nodes within the sequencing network.
-    *   `Base`: Abstract base class for domain entities.
-    *   **Files**:
-        *   [`src/main/java/com/aa/fso/model/FlightKey.java`](src/main/java/com/aa/fso/model/FlightKey.java)
-        *   [`src/main/java/com/aa/fso/model/ITFlightKey.java`](src/main/java/com/aa/fso/model/ITFlightKey.java)
-        *   [`src/main/java/com/aa/fso/model/Node.java`](src/main/java/com/aa/fso/model/Node.java)
-        *   [`src/main/java/com/aa/fso/model/Base.java`](src/main/java/com/aa/fso/model/Base.java)
+| Category | File Path | Class/Interface | Responsibility |
+| :--- | :--- | :--- | :--- |
+| **Model** | `src/main/java/com/aa/fso/model/ITFlightKey.java` | `ITFlightKey` | Unique flight identifier logic. |
+| **Model** | `src/main/java/com/aa/fso/model/DutyInfo.java` | `DutyInfo` | Duty period data structure. |
+| **Model** | `src/main/java/com/aa/fso/model/FlightLeg.java` | `FlightLeg` | Core flight segment entity. |
+| **Model** | `src/main/java/com/aa/fso/model/Network.java` | `Network` | Graph representation for optimization. |
+| **Model** | `src/main/java/com/aa/fso/model/SequencedPosition.java` | `SequencedPosition` | Position in a generated sequence. |
+| **Model** | `src/main/java/com/aa/fso/model/UserInput.java` | `UserInput` | Solver request payload. |
+| **Model** | `src/main/java/com/aa/fso/model/UnsequencedLegPairing.java` | `UnsequencedLegPairing` | Pairing logic for unsequenced legs. |
+| **Model** | `src/main/java/com/aa/fso/model/LocalDateTimeSerializer.java` | `LocalDateTimeSerializer` | Custom JSON serialization for dates. |
+| **DTO** | `src/main/java/com/aa/fso/dto/FlightLegDTO.java` | `FlightLegDTO` | Transfer object for flight legs. |
+| **DTO** | `src/main/java/com/aa/fso/dto/SolverResponseDTO.java` | `SolverResponseDTO` | Response container for solver results. |
+| **DTO** | `src/main/java/com/aa/fso/dto/AccessTokenDTO.java` | `AccessTokenDTO` | Authentication token wrapper. |
+| **DTO** | `src/main/java/com/aa/fso/dto/CKAScheduleDTO.java` | `CKAScheduleDTO` | Schedule data transfer object. |
+| **DTO** | `src/main/java/com/aa/fso/dto/PlaceHolderEvents.java` | `PlaceHolderEvents` | Placeholder for event structures. |
+| **Repository** | `src/main/java/com/aa/fso/repository/OutputDataRepository.java` | `OutputDataRepository` | Persistence interface for outputs. |
+| **Repository** | `src/main/java/com/aa/fso/repository/LegDataRepositoryImpl.java` | `LegDataRepositoryImpl` | Implementation for leg data access. |
+| **Repository** | `src/main/java/com/aa/fso/repository/AccessTokenClientImpl.java` | `AccessTokenClientImpl` | Client implementation for auth. |
+| **Controller** | `src/main/java/com/aa/fso/controller/KillController.java` | `KillController` | Status and kill management endpoints. |
+| **Service** | `src/main/java/com/aa/fso/service/OptimizationService.java` | `OptimizationService` | Core optimization logic. |
+| **Rule** | `src/main/java/com/aa/fso/rules/FAR117FTRule.java` | `FAR117FTRule` | Regulatory compliance rule. |
+| **Rule** | `src/main/java/com/aa/fso/contractualrules/ThreeAMHBT.java` | `ThreeAMHBT` | Contractual rule implementation. |
+| **Request** | `src/main/java/com/aa/fso/qlacheck/request/CrewMemberKey.java` | `CrewMemberKey` | Crew identification key. |
+| **Request** | `src/main/java/com/aa/fso/qlacheck/request/SequenceDetail.java` | `SequenceDetail` | Details for sequence validation. |
+| **Request** | `src/main/java/com/aa/fso/qlacheck/request/DutyPeriods.java` | `DutyPeriods` | Duty period collection. |
+| **Request** | `src/main/java/com/aa/fso/qlacheck/request/Employee.java` | `Employee` | Employee entity. |
+| **Request** | `src/main/java/com/aa/fso/qlacheck/request/BidStatus.java` | `BidStatus` | Bid status enumeration. |
+| **Response** | `src/main/java/com/aa/fso/qlacheck/response/LegalityRuleResult.java` | `LegalityRuleResult` | Result of legality checks. |
+| **Mapper** | `src/main/java/com/aa/fso/mapper/QLAMapper.java` | `QLAMapper` | Mapping logic for QLA checks. |
+| **Config** | `src/main/java/com/aa/fso/config/AzureBlobStorageConfiguration.java` | `AzureBlobStorageConfiguration` | Azure storage integration config. |
+| **Util** | `src/main/java/com/aa/fso/util/FSOUtil.java` | `FSOUtil` | General FSO utilities. |
+| **Exception**| `src/main/java/com/aa/fso/exception/SolverExceptionHandler.java` | `SolverExceptionHandler` | Global exception handler. |
 
-*   **QLA (Quality Assurance) & Rules**:
-    *   **Domain**: Specific to FAR 117 rest time regulations and duty period limits.
-    *   **Classes**:
-        *   `FAR117RestTimeRule`: Encapsulates specific regulatory logic.
-        *   `ScheduledTime`, `TimeInfo`, `FlightDutyPeriod`: Time-related domain objects.
-        *   `LegalityRuleResult`: Output of rule validation.
-    *   **Files**:
-        *   [`src/main/java/com/aa/fso/rules/FAR117RestTimeRule.java`](src/main/java/com/aa/fso/rules/FAR117RestTimeRule.java)
-        *   [`src/main/java/com/aa/fso/qlacheck/request/FlightDutyPeriod.java`](src/main/java/com/aa/fso/qlacheck/request/FlightDutyPeriod.java)
-        *   [`src/main/java/com/aa/fso/qlacheck/response/LegalityRuleResult.java`](src/main/java/com/aa/fso/qlacheck/response/LegalityRuleResult.java)
-
-### 2.2.6 Utilities & Infrastructure
-*   **Validation**: `InputValidationProcessor` ensures incoming data integrity before processing.
-    *   **File**: [`src/main/java/com/aa/fso/processor/InputValidationProcessor.java`](src/main/java/com/aa/fso/processor/InputValidationProcessor.java)
-*   **Graph Construction**: `ConstructNetwork` likely builds the dependency graph required for the solver.
-    *   **File**: [`src/main/java/com/aa/fso/processor/ConstructNetwork.java`](src/main/java/com/aa/fso/processor/ConstructNetwork.java)
-*   **Serialization**: Custom serializers for `LocalDate` and mappers for QLA data.
-    *   **Files**: [`src/main/java/com/aa/fso/qlacheck/request/LocalDateSerializer.java`](src/main/java/com/aa/fso/qlacheck/request/LocalDateSerializer.java), [`src/main/java/com/aa/fso/mapper/QLAMapper.java`](src/main/java/com/aa/fso/mapper/QLAMapper.java)
-*   **Constants**: Global configuration constants.
-    *   **File**: [`src/main/java/com/aa/fso/Constants.java`](src/main/java/com/aa/fso/Constants.java)
-
-## 2.3 Critical Interaction Flows
-
-### 2.3.1 Synchronous Solve Flow
-1.  **Client** sends POST to `/solveDebug` with `UserInput`.
-2.  **HttpSolverController** receives request, instantiates `SolverService`.
-3.  **SolverService** executes logic, potentially interacting with `RunStateManager`.
-4.  **Response** returned as `List<OutputData>`; `RunStateManager` is cleared in `finally`.
-
-### 2.3.2 Asynchronous Solve Flow (Kafka)
-1.  **Producer** publishes `UserInput` to `${solver.topic.name}`.
-2.  **KafkaConsumerService** consumes message.
-3.  **Validation**: Checks `SnapshotIds`; throws exception if invalid.
-4.  **Execution**: Calls `solverService.solve`.
-5.  **Post-Processing**: Compresses solutions via `CompressUtil`.
-6.  **Publish**: Sends compressed bytes to response topic via `KafkaProducerService`.
-7.  **Cleanup**: `RunStateManager.clearRun()` executed in `finally`.
-
-## 2.4 Summary of Core Modules
-| Module | Primary Class(es) | Function |
-| :--- | :--- | :--- |
-| **Ingestion** | `HttpSolverController`, `KafkaConsumerService` | Accepts solver requests via HTTP or Kafka. |
-| **Orchestration** | `SolverService`, `RunStateManager` | Manages execution lifecycle and state. |
-| **Domain Logic** | `PairingGenerationServiceImpl`, `FAR117RestTimeRule` | Implements flight pairing and legality rules. |
-| **Data Access** | `FlightController`, `ITDataServiceImpl` | Retrieves flight and leg data. |
-| **Utilities** | `ConstructNetwork`, `CompressUtil` | Graph building and data compression. |
-
-This inventory establishes the foundation for understanding the system's behavior, highlighting the separation between synchronous debugging interfaces and robust asynchronous production pipelines.
+This inventory confirms a robust separation of concerns, where the `SolverService` acts as the central orchestrator, supported by specialized rule engines and managed state via `RunStateManager`. The dual entry point strategy (HTTP vs. Kafka) ensures flexibility for both development workflows and high-throughput production environments.
 
 
 ## 4. Subsystem Package Diagrams (Chunk-by-Chunk Details)
@@ -607,63 +608,60 @@ flowchart TD
 
 # 3. Technology Stack & Third-party Integrations
 
-The **Sequence Builder** application (`fsoft-ai4code/sequence-builder`) is architected as a high-throughput, event-driven microservice built on the **Spring Boot** ecosystem. The system leverages a polyglot approach where the core orchestration logic resides in Java, while specific parsing and validation tasks may offload to native libraries where performance is critical. The architecture prioritizes asynchronous processing, fault tolerance, and real-time observability.
+The **Sequence Builder** application (`fsoft-ai4code/sequence-builder`) is architected as a high-throughput, event-driven Java service designed to solve complex crew scheduling optimization problems under strict regulatory constraints (e.g., FAR 117). The system leverages a modular monolith structure built on the **Spring Boot** ecosystem, integrating robust asynchronous processing via **Apache Kafka** and specialized rule engines for aviation compliance.
 
-## 3.1 Core Framework & Runtime
+## 3.1 Core Framework & Runtime Environment
 
-The application runtime is anchored by **Spring Boot 3.x**, providing the foundational dependency injection container, embedded HTTP server (Tomcat), and auto-configuration capabilities. The entry point is defined in `SequenceBuilderApplication`, which initializes the context and enables background scheduling via `@EnableScheduling` [src/main/java/com/aa/fso/SequenceBuilderApplication.java:L12-16].
+The application runtime is anchored by **Spring Boot**, providing the foundational infrastructure for dependency injection, RESTful API exposure, and lifecycle management. The entry point is defined in `SequenceBuilderApplication`, which initializes the context and enables scheduled tasks via `@EnableScheduling` [src/main/java/com/aa/fso/SequenceBuilderApplication.java:L12-16].
 
-*   **Web Layer**: Built upon **Spring Web MVC** and **Spring Boot Actuator**. The REST API surface is exposed via standard annotations (`@RestController`, `@GetMapping`, `@PostMapping`). Swagger/OpenAPI documentation is integrated using `springdoc-openapi` to define contract boundaries for endpoints like `/solveDebug` and `/openLegs` [src/main/java/com/aa/fso/controller/HttpSolverController.java:L44-58], [src/main/java/com/aa/fso/controller/FlightController.java:L23-30].
-*   **Dependency Injection**: Heavily utilizes **Lombok** to reduce boilerplate code across the 196 classes, managing getters, setters, and logging instances (`@Slf4j`) directly within model and service layers.
-*   **Configuration Management**: Environment-specific configurations (e.g., Kafka consumer groups, solver timeouts) are externalized via `application.properties` or `application.yml`, injected via `@Value` or `@ConfigurationProperties`.
+*   **Web Layer**: Built upon **Spring Web MVC**, utilizing `@RestController` annotations to expose HTTP endpoints. The architecture separates concerns into Controllers (e.g., `HttpSolverController`, `KillController`, `FlightController`) and Services, ensuring loose coupling between the API surface and business logic [src/main/java/com/aa/fso/controller/HttpSolverController.java:L44-58].
+*   **Dependency Injection**: Heavily relies on **Spring Framework's** `@Autowired` and `@Component` mechanisms to manage the lifecycle of stateful services like `RunStateManager` and `SolverService`.
+*   **Data Binding & Validation**: Utilizes **Jackson** (`com.fasterxml.jackson.databind.ObjectMapper`) for robust JSON serialization and deserialization, particularly critical when mapping incoming `UserInput` payloads to internal domain models [src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java:L42-86].
+*   **Code Generation**: Employs **Lombok** to reduce boilerplate code across the 196 classes in the repository, specifically for getters, setters, and logging (`@Slf4j`), enhancing maintainability within the 710-method codebase.
 
-## 3.2 Asynchronous Messaging & Event Processing
+## 3.2 Asynchronous Event Processing & Messaging
 
-A critical component of the stack is the **Apache Kafka** integration, enabling decoupled communication between the solver engine and upstream event sources (e.g., Azure Event Hubs).
+A critical component of the stack is the **Apache Kafka** integration, enabling decoupled, scalable processing of solver requests. The system operates as both a consumer and producer within the `com.aa.fso.service.kafka` package.
 
-*   **Consumer Architecture**: The `KafkaConsumerService` acts as the primary event listener, consuming messages from the `solver.topic.name` configured in the environment [src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java:L42-86].
-    *   **Concurrency**: The consumer supports configurable concurrency (`${sb.consumer.topics.concurrency}`) to parallelize processing of incoming solver requests.
-    *   **Acknowledgment**: Manual acknowledgment is enforced via `Acknowledgment ack` to ensure exactly-once processing semantics; messages are acknowledged only after successful serialization and compression of results.
-    *   **Error Handling**: The consumer implements a robust try-catch-finally block to handle `KillRunException` and `InvalidUserInputException`, ensuring that failed runs trigger notifications via `TeamsNotification` without blocking the consumer group.
-*   **Producer Integration**: Results are published back to downstream topics as compressed binary payloads (`byte[]`) using `CompressUtil` to minimize network bandwidth, specifically targeting large JSON solution sets [src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java:L70-72].
+*   **Consumer Architecture**: The `KafkaConsumerService` acts as the primary ingestion point for solver jobs. It listens to the configured topic (`${solver.topic.name}`) with a concurrency level defined by `${sb.consumer.topics.concurrency}`. This allows parallel processing of independent optimization runs [src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java:L42-86].
+*   **Message Handling**: Upon consuming a `ConsumerRecord`, the service deserializes the payload into a `UserInput` object. It implements a robust error handling strategy, catching specific exceptions like `KillRunException` to trigger graceful termination workflows and notifications via `TeamsNotification`.
+*   **Producer Integration**: Post-computation, the system serializes the resulting `SolverResponseDTO` into compressed byte arrays using `CompressUtil` and publishes them back to the Kafka cluster via `KafkaProducerService`, ensuring low-latency delivery of results to downstream consumers.
 
-## 3.3 Data Persistence & Storage
+## 3.3 Domain-Specific Libraries & Rule Engines
 
-The system employs a multi-tier storage strategy to handle both transient state and persistent flight data.
+The core value proposition of the Sequence Builder lies in its ability to enforce complex aviation regulations. This is achieved through a custom-built rule engine rather than a generic third-party solver.
 
-*   **Relational Database**: While specific ORM implementations (e.g., Hibernate/JPA) are not explicitly detailed in the provided entry points, the presence of repositories like `LegDataRepository` and `InputDataRepositoryImpl` suggests a JPA-based abstraction layer for querying flight legs and user inputs [src/main/java/com/aa/fso/controller/FlightController.java:L23-30].
-*   **Azure Blob Storage**: For large-scale data persistence (e.g., historical sequences, raw logs), the application integrates with **Azure Blob Storage**.
-    *   **Implementation**: Encapsulated in `AzureBlobController` and `AzureBlobRepositoryImpl`, this layer handles upload/download operations for large datasets [src/main/java/com/aa/fso/controller/AzureBlobController.java].
-    *   **Access Pattern**: The repository implementation likely utilizes the Azure SDK for Java, abstracting connection details behind a clean interface for the service layer.
+*   **Regulatory Compliance**: The system implements specific rule sets such as **FAR 117** (Flight and Duty Limitations) directly in the codebase. The `FAR117FTRule` class encapsulates these logic constraints, ensuring that generated sequences are legally compliant [src/main/java/com/aa/fso/rules/FAR117FTRule.java].
+*   **Optimization Logic**: The `OptimizationService` orchestrates the sequencing algorithm, interacting with domain models like `FlightLeg`, `DutyInfo`, and `UnsequencedLegPairing`. These models are strictly typed to reflect the hierarchical nature of flight schedules [src/main/java/com/aa/fso/service/OptimizationService.java].
+*   **Data Persistence**: The application utilizes **Spring Data JPA** repositories (e.g., `LegDataRepository`, `OutputDataRepository`) to interact with the underlying database. Custom implementations like `LegDataRepositoryImpl` handle complex queries required for fetching open legs based on date ranges and equipment types [src/main/java/com/aa/fso/repository/LegDataRepositoryImpl.java].
 
-## 3.4 Domain Logic & Algorithmic Engines
+## 3.4 Third-Party Integrations & External Services
 
-The core business logic revolves around flight sequence generation and legality checking (QLA - Quality Assurance).
+The application integrates with external systems to support authentication, storage, and observability.
 
-*   **Solver Engine**: The `SolverService` orchestrates the complex algorithmic process of generating flight pairings. It accepts `UserInput` DTOs and returns `SolverResponseDTO` containing lists of `OutputData` (solutions) [src/main/java/com/aa/fso/controller/HttpSolverController.java:L50-52].
-*   **Rule Engines**: Specific aviation regulations (e.g., FAR 117) are implemented as discrete rule classes. `FAR117RestTimeRule` encapsulates the logic for rest time compliance, ensuring generated sequences adhere to regulatory constraints [src/main/java/com/aa/fso/rules/FAR117RestTimeRule.java].
-*   **Data Models**: The domain is modeled using a rich set of entities including `FlightKey`, `ITFlightKey`, `UnsequencedLeg`, and `Node` structures, facilitating graph-based algorithms for sequence construction [src/main/java/com/aa/fso/model/FlightKey.java], [src/main/java/com/aa/fso/model/Node.java].
+### 3.4.1 Azure Blob Storage
+For persistent storage of large solver outputs and historical data, the system integrates with **Azure Blob Storage**. Configuration is managed via `AzureBlobStorageConfiguration`, allowing dynamic access to storage containers based on environment properties [src/main/java/com/aa/fso/config/AzureBlobStorageConfiguration.java].
 
-## 3.5 Utility & Infrastructure Libraries
+### 3.4.2 Authentication & Access Control
+The system supports token-based authentication via `AccessTokenDTO` and `AccessTokenClientImpl`. This module handles the retrieval and validation of access tokens, ensuring secure communication with upstream orchestration systems.
 
-To maintain code quality and performance, several specialized libraries are integrated:
+### 3.4.3 Observability & Notification
+*   **Logging**: Standardized logging is implemented using **SLF4J** with a backend likely configured for structured JSON output, facilitating traceability across distributed components.
+*   **Notifications**: The `TeamsNotification` component integrates with Microsoft Teams webhooks to alert operations teams of critical events, such as run cancellations or solver failures [src/main/java/com/aa/fso/component/TeamsNotification.java].
 
-*   **Serialization**: `Jackson` (`ObjectMapper`) is the primary JSON processor, used extensively for deserializing Kafka messages into `UserInput` objects and serializing responses [src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java:L53-55]. Custom serializers (e.g., `LocalDateSerializer`) are employed to handle date formatting nuances [src/main/java/com/aa/fso/qlacheck/request/LocalDateSerializer.java].
-*   **Compression**: `CompressUtil` provides custom compression logic (likely GZIP or similar) to optimize the transmission of large solution arrays over Kafka [src/main/java/com/aa/fso/util/CompressUtil.java].
-*   **Logging**: `SLF4J` with a backend implementation (e.g., Logback) provides structured logging, capturing trace IDs and contextual data for debugging distributed transactions [src/main/java/com/aa/fso/SequenceBuilderApplication.java:L15].
-*   **Validation**: Input validation is handled via `InputValidationProcessor`, ensuring that incoming payloads meet schema requirements before reaching the solver engine [src/main/java/com/aa/fso/processor/InputValidationProcessor.java].
+## 3.5 Summary of Key Artifacts
 
-## 3.6 Summary of Key Dependencies
+The following files represent the backbone of the technology stack, defining the interfaces and implementations for the core capabilities described above:
 
-| Component | Technology | Usage Context |
+| Component | File Path | Responsibility |
 | :--- | :--- | :--- |
-| **Framework** | Spring Boot | Application lifecycle, DI, Web Server |
-| **Messaging** | Apache Kafka | Event ingestion, result distribution |
-| **Storage** | Azure Blob Storage | Large file persistence |
-| **ORM** | Spring Data JPA | Relational data access (implied) |
-| **Serialization** | Jackson | JSON parsing & transformation |
-| **Documentation** | SpringDoc OpenAPI | API contract definition |
-| **Utilities** | Lombok, SLF4J | Boilerplate reduction, Logging |
-| **Domain Rules** | Custom Java Classes | FAR 117, QLA Logic |
+| **Entry Point** | `src/main/java/com/aa/fso/SequenceBuilderApplication.java` | Application initialization and scheduling enablement. |
+| **HTTP API** | `src/main/java/com/aa/fso/controller/HttpSolverController.java` | Exposes `/solveDebug` endpoint for manual solver invocation. |
+| **Control Plane** | `src/main/java/com/aa/fso/controller/KillController.java` | Manages run lifecycle and status reporting (`/run/status`). |
+| **Data Ingestion** | `src/main/java/com/aa/fso/service/kafka/consumer/KafkaConsumerService.java` | Core event listener for asynchronous job processing. |
+| **Domain Model** | `src/main/java/com/aa/fso/model/FlightLeg.java` | Represents the atomic unit of flight scheduling. |
+| **Rule Engine** | `src/main/java/com/aa/fso/rules/FAR117FTRule.java` | Encapsulates regulatory constraint logic. |
+| **Persistence** | `src/main/java/com/aa/fso/repository/LegDataRepositoryImpl.java` | Custom repository implementation for flight data queries. |
+| **Configuration** | `src/main/java/com/aa/fso/config/AzureBlobStorageConfiguration.java` | Azure storage client setup and bean definition. |
 
-This technology stack ensures the **Sequence Builder** can handle the computational intensity of flight sequencing while maintaining the reliability required for operational aviation systems. The separation of concerns between the web controller layer, the Kafka consumer layer, and the core solver service allows for independent scaling and resilience.
+This technology stack ensures a balance between high-performance computation, strict regulatory adherence, and resilient distributed processing, suitable for mission-critical airline operations.

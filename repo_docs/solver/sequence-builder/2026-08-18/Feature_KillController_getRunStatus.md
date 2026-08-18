@@ -16,22 +16,21 @@ sequenceDiagram
 ### Execution Trace Narration: `KillController.getRunStatus`
 
 **Overview**
-The execution begins at the entry point `KillController.getRunStatus`, located in `src/main/java/com/aa/fso/controller/KillController.java`. This endpoint is mapped to the HTTP GET request `/run/status` and serves as the primary interface for retrieving the current state of the active solver run. The method's logic hinges on the existence of a valid snapshot ID within the `runStateManager`.
+The execution begins at the entry point `KillController.getRunStatus`, located in `src/main/java/com/aa/fso/controller/KillController.java`. This endpoint is mapped to the HTTP GET request `/run/status` and serves as the primary interface for retrieving the current state of an active solver run. The method orchestrates a check against the `runStateManager` to determine if a run is currently active and whether a termination signal has been issued.
 
-**Execution Path & Data Flow**
-Upon invocation, the controller first queries the `runStateManager` to retrieve the identifier of the currently active snapshot by calling `runStateManager.getCurrentSnapshotId()` [KillController.java:18]. The result of this call is assigned to the local variable `currentId`.
+**Execution Path and Logic Flow**
 
-The control flow then proceeds to a conditional check to determine if `currentId` is non-null [KillController.java:19]. This branch dictates the subsequent data retrieval and response construction:
+1.  **State Retrieval**:
+    Upon invocation, the method immediately queries the `runStateManager` instance by calling `getCurrentSnapshotId()` [KillController.java:13]. This operation attempts to fetch the unique identifier associated with the currently executing solver process. The result is assigned to the local variable `currentId`.
 
-1.  **Active Run Scenario (`currentId != null`)**:
-    If a valid snapshot ID exists, the system confirms an active run is in progress. The method immediately invokes `runStateManager.isKillRequested()` to ascertain the kill status [KillController.java:20]. It then constructs a composite string containing both the active snapshot ID and the boolean result of the kill request. This string is wrapped in a `ResponseEntity` with an HTTP 200 OK status and returned to the client [KillController.java:21].
+2.  **Conditional Evaluation**:
+    The control flow proceeds to a conditional check evaluating the nullity of `currentId` [KillController.java:14].
+    *   **Branch A (Active Run)**: If `currentId` is not null, the system confirms an active session exists. The method constructs a response string concatenating the snapshot ID and the result of `runStateManager.isKillRequested()`. This boolean check determines if a kill signal has been queued for the active process. The method then returns an HTTP 200 OK response containing this composite status message [KillController.java:15].
+    *   **Branch B (Inactive State)**: If `currentId` evaluates to null, indicating no solver is currently running, the conditional block is bypassed. The execution falls through to the subsequent return statement [KillController.java:17], which generates a standardized response indicating "No active run".
 
-2.  **Inactive Run Scenario (`currentId == null`)**:
-    If `currentId` evaluates to null, indicating no active solver instance is running, the conditional block is skipped. The execution flows directly to the fallback return statement [KillController.java:23], which returns a `ResponseEntity` with an HTTP 200 OK status and the message "No active run".
+**Data Mutations and Final Outputs**
+Throughout this sequence, no persistent data mutations occur within the controller itself; the logic is strictly read-only, relying on the state exposed by `runStateManager`. The final output is a `ResponseEntity<String>` object. Depending on the runtime state, the payload will be either:
+*   `"Active run: <snapshot_id>, Kill requested: <true/false>"` (if a run is active).
+*   `"No active run"` (if no run is active).
 
-**Final Output**
-The method concludes by returning a JSON-compatible string payload within an HTTP 200 response. The specific output depends entirely on the state of the `runStateManager`:
-*   **Format A**: `"Active run: <snapshot_id>, Kill requested: <true|false>"` when a run is active.
-*   **Format B**: `"No active run"` when no run is currently tracked.
-
-This design ensures the API provides immediate, deterministic feedback regarding the solver's lifecycle status without requiring additional database lookups or complex error handling for missing states.
+This ensures the client receives a deterministic status update regarding both the existence of a run and its termination status.

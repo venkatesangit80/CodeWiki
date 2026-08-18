@@ -130,236 +130,261 @@ flowchart LR
 **Date:** October 26, 2023
 **Status:** Final Audit
 
-## 1. Executive Summary
+## Executive Summary
 
-This report provides a comprehensive technical audit of the Crew Scheduling Optimization Solver. The system utilizes a Constraint Programming approach (FICO Xpress) to generate optimal crew pairings from unsequenced flight legs. While the architectural separation of concerns (Data Ingestion, Graph Construction, Label Setting Algorithm, Optimization) is sound, the audit reveals **Critical** and **High** severity issues regarding concurrency safety, resource management, and algorithmic efficiency.
+This report provides a comprehensive technical audit of the Crew Scheduling Optimization Solver. The system utilizes a Constraint Programming approach (FICO Xpress) to generate optimal crew pairings from unsequenced flight legs. While the architecture demonstrates a robust separation of concerns between data ingestion, graph construction, and optimization, the audit has identified **Critical** and **High** severity issues regarding concurrency safety, resource management, and algorithmic efficiency.
 
-The most significant risks involve the `RunStateManager` singleton managing native Xpress model state without thread-safe isolation, potential native memory leaks in the JNI layer due to lack of explicit disposal, and severe $O(N^2)$ complexity in network construction and deadhead identification loops that will cause catastrophic performance degradation as flight volume scales.
+The most significant risks involve the `RunStateManager` singleton's lack of thread-safe state isolation, potential native memory leaks within the Xpress JNI layer, and $O(N^2)$ complexity in network construction and deadhead identification loops that will degrade performance linearly with fleet size. Additionally, silent failure modes in date/timezone handling and connection drop policies pose operational stability risks.
 
 ---
 
-## 2. Core Data Flow Diagram (DFD) with Risk Overlay
+## 1. Core Data Flow Diagram (DFD) with Risk Overlay
 
-The following diagram illustrates the data flow from ingestion to solution generation. **Nodes highlighted in Red (`fill:#ffcccc,stroke:#ff3333`)** represent components identified with **High** or **Critical** severity vulnerabilities in the audit below.
+The following diagram illustrates the data flow from ingress to egress. **Nodes highlighted in Red (`fill:#ffcccc,stroke:#ff3333`)** represent components identified with **High** or **Critical** severity vulnerabilities in Section 3.
 
 ```mermaid
-flowchart TD
-    subgraph Ingestion ["Ingestion Layer"]
-        K["Kafka Consumer Service"]
-        H["HTTP Solver Controller"]
-        F["Flight Controller"]
+graph TD
+    %% Define Styles
+    classDef normal fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef riskHigh fill:#ffcccc,stroke:#ff3333,stroke-width:2px,stroke-dasharray: 5 5;
+    classDef riskCrit fill:#ff0000,stroke:#8b0000,stroke-width:2px,color:white;
+    classDef db fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+
+    %% Ingress Layer
+    subgraph Ingress ["Ingress Layer"]
+        K1["Kafka Consumer (KafkaConsumerService)"]:::normal
+        K2["HTTP Controller (HttpSolverController)"]:::normal
+        K3["Kill Controller (KillController)"]:::riskHigh
     end
 
-    subgraph Processing ["Processing & Logic Layer"]
-        O["OptimizationServiceImpl"]
-        D["DHProcessor (Deadhead Logic)"]
-        C["ConstructNetwork (Graph Build)"]
-        S["ShortestPathComponent (Label Setting)"]
-        P["PairingGenerationServiceImpl"]
+    %% Processing Layer
+    subgraph Processing ["Core Processing & Logic"]
+        direction TB
+        P1["Optimization Service (OptimizationServiceImpl)"]:::normal
+        P2["DH Processor (DHProcessor)"]:::riskCrit
+        P3["Network Builder (ConstructNetwork)"]:::riskCrit
+        P4["Shortest Path Component (ShortestPathComponent)"]:::riskCrit
+        P5["Run State Manager (RunStateManager)"]:::riskCrit
+        P6["Opt Model (OptModel) - JNI]:::riskCrit
     end
 
-    subgraph Optimization ["Native Optimization Layer"]
-        M["OptModel (Xpress JNI)"]
-        R["RunStateManager (Singleton State)"]
+    %% Data Layer
+    subgraph Data ["Data & Storage"]
+        D1["Azure Blob Storage"]:::db
+        D2["Static Data Files"]:::db
+        D3["In-Memory Graph (Network)"]:::normal
     end
 
-    subgraph Output ["Output & Telemetry"]
-        T["Teams Notification"]
-        A["Azure Blob Storage"]
+    %% Egress Layer
+    subgraph Egress ["Egress Layer"]
+        E1["Kafka Producer (KafkaProducerService)"]:::normal
+        E2["Teams Notification"]:::normal
     end
 
-    %% Data Flow
-    K --> O
-    H --> O
-    F --> O
+    %% Connections
+    K1 --> P1
+    K2 --> P1
+    K3 -.-> P5
     
-    O --> D
-    D --> C
-    C --> P
-    P --> S
-    S --> M
+    P1 --> P2
+    P1 --> P3
+    P1 --> P4
+    P1 --> P6
     
-    M -.->|Native Calls| R
-    R -.->|State Check| S
-    R -.->|State Check| M
+    P2 --> D2
+    P3 --> D2
+    P3 --> D3
+    P4 --> D3
+    P6 --> P5
     
-    M --> A
-    T --> A
+    P1 --> D1
+    P1 --> E1
+    P5 -.-> E2
 
-    %% Risk Styling
-    style R fill:#ffcccc,stroke:#ff3333,stroke-width:2px
-    style S fill:#ffcccc,stroke:#ff3333,stroke-width:2px
-    style C fill:#ffcccc,stroke:#ff3333,stroke-width:2px
-    style D fill:#ffcccc,stroke:#ff3333,stroke-width:2px
-    style M fill:#ffcccc,stroke:#ff3333,stroke-width:2px
+    %% Risk Annotations
+    linkStyle 3 stroke:#ff3333,stroke-width:2px;
+    linkStyle 4 stroke:#ff3333,stroke-width:2px;
+    linkStyle 5 stroke:#ff3333,stroke-width:2px;
+    linkStyle 6 stroke:#ff3333,stroke-width:2px;
+    linkStyle 7 stroke:#ff3333,stroke-width:2px;
 
-    %% Legend
-    note["Risk Legend: Red = Critical/High Severity"]
+    %% Apply Classes to Nodes
+    class K3,K5,P2,P3,P4,P5,P6 riskCrit;
+    class P5 riskCrit;
 ```
+
+*Note: The diagram uses `riskCrit` (Red) for Critical issues (Concurrency, JNI Leaks, Loop Complexity) and `riskHigh` (Orange) for High issues (Silent Fallbacks, Connection Config).*
 
 ---
 
-## 3. Technical Audit & Vulnerability Analysis
+## 2. Detailed Vulnerability Audit (Section 3 Findings)
 
-### 3.1. Concurrency Hazards & Singleton State Contamination (Critical)
-**Finding:** The `RunStateManager` acts as a global singleton holding the state of the active Xpress optimization model and a volatile kill flag.
-**Evidence:** `src/main/java/com/aa/fso/service/RunStateManager.java`
-**Analysis:**
-The class manages `activeModel` (the native Xpress handle) and `killRequested` (volatile boolean). The documentation states, "Since there is only ever one run per pod, this is a singleton service." However, the `SolverService` iterates over multiple `snapshotIds` in a loop:
-```java
-for (String snapshotId : userInput.getSnapshotIds()) {
-    try {
-        // ... process snapshot ...
-    } catch (Exception e) {
-        // ...
-    }
-}
-```
-If the system is configured to handle concurrent requests (e.g., via a thread pool or multiple pods sharing state incorrectly), or if a previous run hasn't fully cleared `activeModel` before the next iteration begins, race conditions occur. Specifically, `optModel.runModel(runStateManager)` registers the model. If a kill request comes in during the loop, the `throwKillExceptionIfKillRequested()` is checked, but the `activeModel` reference in the singleton might be overwritten or accessed concurrently if the loop logic is not strictly serialized.
-**Risk:** Thread-safety violation leading to `NullPointerException` when accessing `activeModel`, or attempting to kill a model that belongs to a different snapshot context.
+### 2.1 Concurrency Hazards & Singleton State Contamination (Critical)
+**Location:** `src/main/java/com/aa/fso/service/RunStateManager.java`
+**Issue:** The `RunStateManager` is documented as a singleton ("Since there is only ever one run per pod"), yet it manages volatile flags (`killRequested`) and model references (`activeModel`) that are accessed across multiple threads (Kafka consumer threads, HTTP request threads, and background optimization threads).
+*   **Risk:** While `volatile` ensures visibility, the lack of explicit synchronization or atomic wrappers for compound actions (e.g., `registerRun` followed by `runModel`) creates a race condition window. If a `killRun` request arrives while `runModel` is initializing the Xpress model, the `activeModel` reference might be null or partially initialized, leading to `NullPointerException` or `IllegalStateException` during native termination.
+*   **Code Evidence:**
+    ```java
+    // RunStateManager.java
+    public void registerRun(String snapshotId) { ... } // No synchronization
+    public void registerModel(OptModel model) { activeModel.set(model); } // AtomicReference usage is good, but logic flow is risky
+    ```
+    The `clearRun()` method resets state without ensuring the native model is fully terminated before clearing the reference, potentially leaving dangling native handles if a crash occurs mid-process.
 
-### 3.2. Resource Leaks & Native Memory Allocation Risks (High)
-**Finding:** Potential for Native Memory Leaks in JNI interactions and unclosed streams.
-**Evidence:** `src/main/java/com/aa/fso/optmodel/OptModel.java`, `src/main/java/com/aa/fso/repository/InputDataRepositoryImpl.java`
-**Analysis:**
-1.  **Xpress Model Lifecycle:** The `OptModel` class interacts with the FICO Xpress native library via JNI. The `runModel` method calls `model.getXPRSprob().mipOptimize(...)`. While the `RunStateManager` attempts to handle kills, there is no explicit `finally` block in `OptModel` ensuring `model.close()` or `model.free()` is called if an exception occurs during `constructVariables` or `parseSolution`. If the JVM crashes or an exception bypasses the `try-catch` in `OptimizationServiceImpl`, the native memory associated with the Xpress problem remains allocated until the process restarts.
-2.  **Stream Handling:** In `InputDataRepositoryImpl.getAllFlightsInfo`, `ObjectMapper` reads from a `FileSystemResource`. While `BufferedReader` is used, the `InputStream` is not explicitly closed in a `finally` block if an `IOException` occurs during parsing, potentially leaking file descriptors in high-throughput scenarios.
-**Recommendation:** Implement strict `try-with-resources` for all IO streams and ensure `OptModel` implements `AutoCloseable` with a guaranteed cleanup of the native Xpress handle in a `finally` block.
-
-### 3.3. Ingestion/Loop Inefficiencies (Critical Performance)
-**Finding:** $O(N^2)$ and $O(N^3)$ complexity in graph construction and deadhead identification.
-**Evidence:** `src/main/java/com/aa/fso/processor/ConstructNetwork.java`, `src/main/java/com/aa/fso/processor/DHProcessor.java`
-**Analysis:**
-1.  **Network Construction ($O(N^2)$):** In `ConstructNetwork.buildNetwork`, the code iterates through all nodes to find valid edges:
+### 2.2 Ingestion/Loop Inefficiencies (Critical)
+**Location:** `src/main/java/com/aa/fso/processor/ConstructNetwork.java` & `src/main/java/com/aa/fso/processor/DHProcessor.java`
+**Issue:** The system performs $O(N^2)$ nested loops for network construction and deadhead identification, which is unacceptable for streaming environments with large fleets.
+*   **ConstructNetwork:** The `buildNetwork` method iterates through all nodes to find valid edges:
     ```java
     for (int i = 0; i < nodes.size() - 1; i++) {
-        for (int j = 1; j < nodes.size(); j++) {
-            // ... check connection time ...
+        for (int j = 1; j < nodes.size(); j++) { // O(N^2)
+            // ... connection time checks
         }
     }
     ```
-    With $N$ flight legs, this results in $N^2$ comparisons. For a large roster (e.g., 5,000 legs), this is 25 million operations per base.
-2.  **Deadhead Identification ($O(N^2 \times D)$):** In `DHProcessor.computeDHDNodes`, nested loops iterate over `unsequencedLegs` and then search for compatible deadheads across multiple bases and dates. The logic involves scanning maps and iterating through date offsets for every leg pair.
+    With $N$ representing flight legs, this results in quadratic growth. For a fleet of 10,000 legs, this is 100 million iterations per base.
+*   **DHProcessor:** The `computeDHDNodes` method iterates through every unsequenced leg against every base and then scans a date map:
     ```java
     for (UnsequencedLeg unseq1 : unsequencedLegs) {
         for (String base : ModelParams.BASES) {
-            // ... nested loops for date offsets ...
+            // ... nested loops for date offsets
             for (UnsequencedLeg leg : navigableFlights.descendingMap().values()) {
                 // ...
             }
         }
     }
     ```
-    This creates a quadratic (or worse) dependency on the number of legs.
-**Impact:** As the number of unsequenced legs grows, the solver time will increase exponentially, likely causing timeouts or OOM errors.
-**Recommendation:** Replace linear scans with spatial indexing (e.g., Interval Trees for time windows) or pre-filtered Maps keyed by `(Station, Date)` to achieve $O(N \log N)$ or $O(N)$ complexity.
+    **Recommendation:** Replace linear scans with spatial indexing (e.g., Interval Trees or Geohashes) or pre-filtered maps keyed by `(Station, Date)` to achieve $O(N \log N)$ or $O(N)$ complexity.
 
-### 3.4. Date/Timezone Comparison Vulnerabilities (Medium-High)
-**Finding:** Reliance on string equality or naive `equals()` for date/time comparisons without normalization.
-**Evidence:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`, `src/main/java/com/aa/fso/util/FSOUtil.java`
-**Analysis:**
-The code frequently uses `DateTimeDTO` objects. In `updateDateTimeBase`, the logic calculates adjustments based on `snapshotParams.getRunDateTime()`. However, in `isValidConnectionTime` and `isDhdLegal`, comparisons are made using `ChronoUnit.MINUTES.between`. While `ChronoUnit` handles `LocalDateTime` correctly, the code relies heavily on string representations for keys (e.g., `FSOUtil.covertLocalDateToString`).
-More critically, in `ShortestPathComponent.setFeasiblePairings`:
-```java
-if (!pairing.getFlightNodes().get(0).getDepartureStation().equals(
-        pairing.getFlightNodes().get(pairing.getFlightNodes().size() - 1).getArrivalStation())
-```
-If `getDepartureStation()` returns a string with trailing whitespace or different casing (e.g., "DFW " vs "DFW"), the logic fails silently. Furthermore, if `DateTimeDTO` stores time as a string in different formats (e.g., `+00:00` vs `Z`), direct string equality checks (if any exist in hidden logic) would fail. The `updateDateTimeBase` method modifies `BaseTime` but does not normalize the underlying `LocalDateTime` representation before comparison in downstream logic, risking subtle bugs where a time is 1 minute off due to DST transition handling logic being applied inconsistently.
+### 2.3 Resource Leaks & Native Memory Allocation (Critical)
+**Location:** `src/main/java/com/aa/fso/optmodel/OptModel.java`
+**Issue:** The FICO Xpress optimizer is a native C++ library invoked via JNI. The `runModel` method initializes the model but lacks a guaranteed `finally` block to ensure `model.free()` or `model.close()` is called if an exception occurs during `mipOptimize`.
+*   **Risk:** If `mipOptimize` throws an exception (e.g., out of memory, infeasibility handling error), the native memory allocated for the problem definition, variable arrays, and constraint matrices remains allocated. Over repeated runs, this leads to native memory exhaustion (OOM) even if Java heap is sufficient.
+*   **Code Evidence:**
+    ```java
+    // OptModel.java
+    public void runModel(RunStateManager runStateManager) throws KillRunException {
+        // ... setup ...
+        model.mipOptimize("d"); // Potential exception here
+        // ... parsing ...
+        // NO FINALLY BLOCK TO FREE MODEL
+    }
+    ```
+    The `RunStateManager` attempts to handle kills, but if the kill signal arrives *during* optimization, the native context might be left in an inconsistent state.
 
-### 3.5. Silent Logic Fallbacks (High)
-**Finding:** Critical state parameters are collapsed to defaults without logging or exception throwing.
-**Evidence:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
-**Analysis:**
-In `identifyDhdFromBase` and `identifyDhdToBase`, if the loop over `departureDateMap` finds no valid deadhead, the method simply returns without setting any flag or logging a warning.
-```java
-if (isDhdLegal(...)) {
-    // ... update pairing ...
-    return;
-}
-// Implicitly returns null/no-op if no DH found
-```
-Similarly, in `DHProcessor.computeDHDNodes`, if a leg cannot be matched, it is simply skipped. There is no mechanism to report "Unmatched Legs" to the user or the logging system, making it impossible to diagnose why certain flights were excluded from the solution space.
-**Risk:** Silent failure leads to incomplete solutions where valid flights are dropped without explanation.
+### 2.4 Date/Timezone Comparison Vulnerabilities (High)
+**Location:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java` & `src/main/java/com/aa/fso/processor/DHProcessor.java`
+**Issue:** The code relies heavily on `LocalDateTime` and string comparisons for date logic, often ignoring timezone normalization or precision differences.
+*   **Risk:** In `updateDateTimeBase`, the code calculates adjustments based on `snapshotParams.getRunDateTime()`. If the input data contains timestamps with mixed formats (e.g., `+00:00` vs `Z`), or if the `StationTimeAdjust` logic assumes a specific offset that doesn't match the actual `LocalDateTime` representation, illegal pairings may be generated or valid ones discarded.
+*   **Code Evidence:**
+    ```java
+    // ShortestPathComponent.java
+    if (snapshotTime >= stationAdjustment.getStartDateXinTime()
+            && snapshotTime <= stationAdjustment.getEndDateXinTime()) {
+        timeAdjustment += 60;
+    }
+    ```
+    The comparison `snapshotTime >= ...` relies on integer arithmetic derived from `ChronoUnit.MINUTES.between`. If the underlying `LocalDateTime` objects have different precision or if the `origin` calculation drifts, the logic fails silently. Furthermore, `Objects.equals()` or `==` on `DateTimeDTO` strings (if used elsewhere) would fail on timezone notation mismatches.
 
-### 3.6. Silent Connection Drops & Configuration Mismatch (Medium)
-**Finding:** Connection idle limits may not match broker/event hub timeouts.
-**Evidence:** Configuration files (implied), `src/main/java/com/aa/fso/config/AzureBlobStorageConfiguration.java`
-**Analysis:**
-While specific `max.idle.ms` values are not visible in the provided Java snippets, the `AzureBlobStorageConfiguration` initializes clients. If the underlying Azure Blob client or Kafka consumer maintains connections longer than the broker's idle timeout, connections will be silently dropped. The `KafkaConsumerService` does not show explicit reconnection logic for dropped connections beyond the standard consumer rebalance.
-**Recommendation:** Explicitly configure `max.idle.ms` in the Kafka consumer and Azure client to be strictly less than the broker's idle timeout (e.g., set client timeout to 80% of broker timeout).
+### 2.5 Silent Logic Fallbacks (High)
+**Location:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
+**Issue:** Several methods contain `catch` blocks or conditional branches that default to "safe" states without logging or throwing exceptions.
+*   **Risk:** In `identifyDhdFromBase` and `identifyDhdToBase`, if the `dhdHM` map lookup returns `null` or the inner loops find no valid legs, the method simply returns without indicating failure. This causes the solver to proceed with incomplete data, potentially generating invalid pairings or missing critical deadhead opportunities.
+*   **Code Evidence:**
+    ```java
+    // ShortestPathComponent.java
+    if (departureDateMap != null) {
+        // ... loops ...
+        // If no match found, method returns void. No log, no exception.
+    }
+    ```
+    Similarly, in `updateDateTimeBase`, if `stationAdjustment` is null, the method returns the original time without logging a warning, potentially masking configuration errors.
 
-### 3.7. Liveness Probe and Monitoring Failures (Medium)
-**Finding:** Health checks may not detect blocked threads or native hangs.
-**Evidence:** `src/main/java/com/aa/fso/controller/KillController.java`, `src/main/java/com/aa/fso/service/RunStateManager.java`
-**Analysis:**
-The `/run/status` endpoint checks a volatile flag `killRequested`. It does **not** check if the `OptModel` is currently stuck in `mipOptimize`. If the Xpress solver enters a long-running branch-and-bound phase (common in hard instances), the liveness probe will return "OK" even though the application is effectively hung. The `KillController` relies on the `RunStateManager` to interrupt the native call, but if the native call is blocking the main thread without periodic checks, the kill signal might be delayed or ignored depending on the Xpress version's interruptibility.
-**Risk:** Kubernetes liveness probes will not trigger a restart for hung solvers, leading to stale pods.
+### 2.6 Silent Connection Drops (High)
+**Location:** Configuration Files (Implicit) & `src/main/java/com/aa/fso/repository/AzureBlobRepositoryImpl.java`
+**Issue:** The audit of `AzureBlobRepositoryImpl` shows standard HTTP client usage. Without explicit configuration for `connections.max.idle.ms` or `keepAliveTimeout`, the underlying HTTP client may reuse connections that have been closed by the Azure Blob Storage service due to idle timeouts.
+*   **Risk:** "Silent" connection drops occur when the client attempts to use a stale socket, resulting in `SocketException` or `ConnectException` that might be caught and swallowed by higher-level error handlers, leading to data loss or retry storms.
 
----
-
-## 4. Performance Issues Summary
-
-*   **Concurrency Hazard:** `RunStateManager` singleton holds native Xpress model state without thread-safe isolation, risking race conditions during multi-snapshot loops.
-*   **Native Memory Leak:** `OptModel` lacks explicit `finally` block cleanup for FICO Xpress JNI handles, risking native memory leaks on exception paths.
-*   **Quadratic Graph Construction:** `ConstructNetwork.buildNetwork` performs $O(N^2)$ edge comparisons, causing exponential slowdown as flight leg counts increase.
-*   **Inefficient Deadhead Search:** `DHProcessor.computeDHDNodes` uses nested loops over legs and bases ($O(N^2 \times Bases)$) instead of pre-indexed lookups.
-*   **Silent Failure Logic:** `identifyDhdFromBase` and `identifyDhdToBase` silently drop unmatched legs without logging or error reporting.
-*   **Thread Safety Risk:** `RunStateManager` volatile flag checks are insufficient to guarantee atomicity of the native model state during concurrent kill requests.
-*   **Blocking Native Call:** Liveness probes do not detect if `OptModel.mipOptimize` is blocking the main thread, preventing automatic recovery from hung solvers.
-*   **Date Normalization Risk:** Reliance on string-based station/date keys and inconsistent `DateTimeDTO` handling risks silent logic errors in time comparisons.
-*   **Stream Resource Leak:** `InputDataRepositoryImpl` does not guarantee `InputStream` closure in all exception paths.
-*   **Configuration Drift:** Potential mismatch between client-side connection idle timeouts and broker/event hub idle limits.
+### 2.7 Liveness Probe & Monitoring Failures (Medium)
+**Location:** Deployment Configurations (Implicit) & `src/main/java/com/aa/fso/service/RunStateManager.java`
+**Issue:** The `RunStateManager` tracks the `killRequested` flag. However, if the optimization thread enters a blocked state (e.g., waiting for a lock in the Xpress native library or a deadlock in the graph traversal), the liveness probe (typically checking HTTP `/run/status`) will still return "OK" because the JVM is alive, even though the solver is hung.
+*   **Risk:** Long-running batch operations (e.g., solving for a massive network) may trigger Kubernetes liveness probes that kill the pod prematurely if the probe interval is too short relative to the optimization time, or conversely, fail to detect a hang if the probe only checks the main thread.
 
 ---
 
-## 5. Detailed Ingress and Egress Interface Boundaries
+## 3. Performance Issues Summary
 
-### 5.1. Ingress (Entry Points)
-The system accepts optimization requests through three primary channels:
-1.  **Kafka Event Bus (`KafkaConsumerService`):**
-    *   **Trigger:** Consumption of messages from `${solver.topic.name}`.
-    *   **Payload:** JSON serialized `UserInput` containing snapshot IDs, fleet constraints, and base exclusions.
-    *   **Flow:** Deserialization -> Validation -> `SolverService.solve()` -> Async processing.
-2.  **HTTP REST API (`HttpSolverController`):**
-    *   **Endpoint:** `POST /solveDebug` (Manual testing) and `POST /solve` (Production).
-    *   **Payload:** Direct `UserInput` JSON.
-    *   **Flow:** Synchronous request -> `SolverService.solve()` -> Response DTO.
-3.  **Internal/Debug APIs:**
-    *   **Endpoints:** `/run/status`, `/kill/**`, `/userInput/**`.
-    *   **Purpose:** Operational control (kill signals, status checks) and data retrieval.
+*   **Concurrency Hazard:** `RunStateManager` singleton lacks thread-safe state isolation for `killRequested` and `activeModel` during concurrent HTTP/Kafka requests.
+*   **Native Memory Leak:** `OptModel.runModel` lacks a `finally` block to guarantee FICO Xpress native memory deallocation on exception or early exit.
+*   **Quadratic Complexity:** `ConstructNetwork.buildNetwork` performs $O(N^2)$ edge generation loops, causing severe CPU saturation as flight leg counts increase.
+*   **Linear Scan Bottleneck:** `DHProcessor.computeDHDNodes` iterates through all bases and dates for every leg, failing to utilize map-based lookups for $O(1)$ retrieval.
+*   **Timezone Fragility:** `updateDateTimeBase` and related methods rely on integer minute calculations that may fail silently on timezone notation mismatches or precision drift.
+*   **Silent Failure:** `identifyDhdFromBase` and `identifyDhdToBase` return void on missing data without logging warnings or throwing exceptions.
+*   **Connection Timeout Risk:** Azure Blob storage clients lack explicit idle timeout configuration, risking silent connection drops and retries.
+*   **Liveness Blindness:** Liveness probes do not detect native thread hangs or blocked optimization threads, risking premature pod termination or undetected hangs.
+*   **GC Pressure:** `ShortestPathComponent` creates excessive temporary objects (Streams, Lists) within tight loops, increasing Garbage Collection frequency.
+*   **Blocking I/O:** `LegDataRepositoryImpl` uses synchronous file reading (`BufferedReader`) which blocks the processing thread during heavy I/O.
 
-### 5.2. Egress (Outgoing Dependencies)
-The system interacts with external and internal services to gather data and persist results:
-1.  **Native Optimization Engine (FICO Xpress):**
-    *   **Interface:** JNI calls via `OptModel`.
-    *   **Risk:** Native memory management, blocking execution.
-2.  **Data Storage (Azure Blob / Local FS):**
-    *   **Interface:** `AzureBlobRepositoryImpl`, `InputDataRepositoryImpl`.
-    *   **Usage:** Reading static data (station adjustments, surface legs), reading flight data (JSON), writing solution outputs.
-3.  **External APIs (FOS / TAPI):**
-    *   **Interface:** `LegDataRepositoryImpl.connectToFOS` (SOAP/HTTP).
-    *   **Usage:** Fetching real-time flight data or deadhead legs from legacy systems.
-4.  **Messaging (Kafka Producer):**
+---
+
+## 4. Detailed Ingress and Egress Interface Boundaries
+
+### 4.1 Ingress Interfaces (Entry Points)
+The system accepts inputs via three primary channels, each requiring strict validation and state isolation:
+
+1.  **Kafka Consumer (`KafkaConsumerService.consumeMessage`):**
+    *   **Protocol:** Apache Kafka (Topic: `${solver.topic.name}`)
+    *   **Payload:** JSON `UserInput` object.
+    *   **Boundary:** Asynchronous, high-throughput. Requires immediate state registration in `RunStateManager`.
+    *   **Risk:** Concurrent consumption of multiple snapshots requires strict isolation of `RunStateManager` state.
+
+2.  **HTTP REST API (`HttpSolverController.solveDebug`):**
+    *   **Protocol:** HTTPS (POST `/solveDebug`)
+    *   **Payload:** JSON `UserInput`.
+    *   **Boundary:** Synchronous, low-latency. Directly invokes `SolverService`.
+    *   **Risk:** Blocking the web server thread during long optimization runs.
+
+3.  **Kill Signal (`KillController.getRunStatus` / `killRun`):**
+    *   **Protocol:** HTTP (GET/POST)
+    *   **Boundary:** External control plane. Sets the `killRequested` volatile flag.
+    *   **Risk:** Race conditions with the optimization thread.
+
+### 4.2 Egress Interfaces (Outgoing Dependencies)
+The system interacts with external systems for data persistence, notifications, and optimization:
+
+1.  **Optimization Engine (FICO Xpress):**
+    *   **Type:** In-Process Native C++ (JNI).
+    *   **Interface:** `OptModel.runModel`.
+    *   **Risk:** Native memory leaks, blocking threads, non-deterministic execution times.
+
+2.  **Data Persistence (Azure Blob Storage):**
+    *   **Type:** Cloud Object Storage.
+    *   **Interface:** `AzureBlobRepositoryImpl.saveData`, `InputDataRepositoryImpl`.
+    *   **Risk:** Network latency, connection timeouts, eventual consistency.
+
+3.  **Message Queue (Kafka Producer):**
+    *   **Type:** Asynchronous Messaging.
     *   **Interface:** `KafkaProducerService`.
-    *   **Usage:** Publishing compressed solution bytes to downstream consumers.
-5.  **Notification Services (Teams):**
-    *   **Interface:** `TeamsNotification` (HTTP POST).
-    *   **Usage:** Sending alerts for job start, completion, or kill events.
+    *   **Risk:** Message loss if producer buffer fills, serialization errors.
+
+4.  **External Notifications (Microsoft Teams):**
+    *   **Type:** HTTP Webhook.
+    *   **Interface:** `TeamsNotification._sendNotificationToTeams`.
+    *   **Risk:** External API rate limiting, network failures.
+
+5.  **Legacy Systems (TAPI/FOS):**
+    *   **Type:** SOAP/HTTP.
+    *   **Interface:** `LegDataRepositoryImpl.connectToFOS`.
+    *   **Risk:** Synchronous blocking, legacy protocol overhead.
 
 ---
 
-## 6. Inferred Performance Challenges
+## 5. Inferred Performance Challenges
 
-Based on the code structure and algorithmic choices, the following performance challenges are inferred:
+Based on the code analysis, the following performance challenges are inferred:
 
-1.  **CPU Bottleneck in Graph Generation:**
-    The `ConstructNetwork` class generates a dense graph by comparing every node against every other node. For a typical airline roster with thousands of legs, this $O(N^2)$ operation dominates the runtime before the optimization even begins. The lack of spatial pruning (e.g., only checking nodes within a specific time window) ensures the CPU spends excessive cycles on impossible connections.
+1.  **CPU Saturation in Graph Construction:**
+    The $O(N^2)$ loop in `ConstructNetwork.buildNetwork` is the primary CPU bottleneck. For a typical airline fleet with thousands of daily legs, this step will dominate the runtime. The lack of spatial pruning (e.g., only checking legs within a specific time window or geographic radius) means the CPU spends cycles comparing incompatible legs.
 
-2.  **JNI Native Heap Pressure:**
-    The `OptModel` class creates a new Xpress problem instance for every optimization run. If the `clearRun` or `close` methods are not robustly called (especially in error paths), the native heap will grow linearly with the number of requests. Given the heavy use of `XPRSprob` objects, this is a high-risk area for OutOfMemoryError (OOM) in the native process, which often manifests as a JVM crash rather than a Java heap dump.
-
-3.  **Blocking Thread Pool Exhaustion:**
-    The `SolverService` processes snapshots sequentially in a loop (`for (String snapshotId : ...)`). If the Xpress solver encounters a difficult instance, it blocks the thread for an extended period. Since the `RunStateManager` is a singleton, subsequent requests (if any are queued) will wait. In a containerized environment with limited CPU quotas, this can lead to thread starvation and eventual timeout of the entire pod.
-
-4.  **Database/File I/O Latency:**
-    The `Input
+2.  **Native Heap Fragmentation:**
+    The `OptModel` class creates a new Xpress problem instance for every run. Without explicit cleanup in a `finally` block, native heap fragmentation will occur over time, especially in a long-running pod that processes many small jobs. This will eventually lead to `OutOfMemoryError` at the native level, crashing the

@@ -1,50 +1,49 @@
+```markdown
 # RCA Context Prompt: Sequence Builder Incident Observer
 
 ## 1. System Blueprint & Tech Stack
-*   **Core Runtime**: Spring Boot 3.x (Embedded Tomcat, Actuator, Auto-config).
-*   **Entry Point**: `SequenceBuilderApplication` (Scheduling enabled).
-*   **Ingestion**: Apache Kafka (`solver.topic.name`), Manual Ack (`Acknowledgment ack`), Exactly-Once Semantics.
-*   **Orchestration**: `KafkaConsumerService` (Concurrency: `${sb.consumer.topics.concurrency}`).
-*   **Logic Engine**: `SolverService` + Rule Engines (`FAR117RestTimeRule`, QLA).
-*   **Persistence**:
-    *   Relational: Spring Data JPA (`LegDataRepository`, `InputDataRepositoryImpl`).
-    *   Object Storage: Azure Blob Storage (`AzureBlobController`, `AzureBlobRepositoryImpl`).
-*   **Data Flow**: Kafka Consumer → Validation (`InputValidationProcessor`) → Solver → Compression (`CompressUtil`) → Kafka Producer.
-*   **Key Classes**: `ShortestPathComponent`, `ConstructNetwork`, `RunStateManager`, `JsonUtil`, `LegDataRepositoryImpl`.
+- **Core Runtime**: Spring Boot Monolith (`SequenceBuilderApplication`), Java 17+ (implied).
+- **Ingestion**: Apache Kafka Consumer (`KafkaConsumerService`), Topic: `${solver.topic.name}`, Concurrency: `${sb.consumer.topics.concurrency}`.
+- **Processing**: 
+  - Solver Engine: `OptimizationService` + `ShortestPathComponent`.
+  - Rules: Custom Rule Engine (`FAR117FTRule`, `PilotRedeyeRule`, `BaseLayover`).
+  - Models: `FlightLeg`, `DutyInfo`, `UnsequencedLegPairing`.
+- **Persistence**: Spring Data JPA (`LegDataRepositoryImpl`, `OutputDataRepository`), Azure Blob Storage (`AzureBlobRepositoryImpl`).
+- **External**: HTTP (FOS Update), Auth (PingFederate/Access Tokens), Notifications (MS Teams).
+- **Key Artifacts**: 
+  - `HttpSolverController` (API Entry), `KillController` (Lifecycle), `LegDataRepositoryImpl` (DB/HTTP), `FSOUtil` (Utils).
 
 ## 2. Architectural Advantages & Safeguards
-*   **Fault Tolerance**: Manual Kafka ACK ensures message processing completion before offset commit; `try-catch-finally` blocks in consumers prevent consumer group blocking on exceptions.
-*   **Observability**: SLF4J/Logback with Trace IDs; Spring Actuator for health checks; Swagger/OpenAPI for contract validation.
-*   **Performance**: Async processing model; Binary payload compression (`CompressUtil`) for large JSON solutions; Polyglot offloading for critical parsing.
-*   **Isolation**: Separation of Web Layer (REST), Event Layer (Kafka), and Core Logic (Solver) allows independent scaling.
-*   **Validation**: Pre-processing via `InputValidationProcessor` to reject malformed payloads early.
+- **Decoupling**: Kafka-based async processing isolates API latency from solver compute time.
+- **Resilience**: `KillController` exposes `/run/status` and `/kill` endpoints for manual intervention.
+- **Validation**: `TeamsNotification` triggers on `KillRunException` for immediate ops visibility.
+- **Serialization**: Jackson `ObjectMapper` handles robust JSON binding for `UserInput`/`SolverResponseDTO`.
+- **Modularity**: Lombok reduces boilerplate; distinct separation of Controllers, Services, and Repositories.
 
 ## 3. Architectural Limitations
-*   **Memory Churn**: Aggressive deep cloning of `DutyInfo`/`UnsequencedLegPairing` in tight loops (`ShortestPathComponent`).
-*   **Algorithmic Complexity**: $O(N^2)$ edge construction in `ConstructNetwork.buildNetwork`; $O(L^2)$ path reconstruction via `LinkedList.add(0, ...)`.
-*   **Resource Leaks**:
-    *   I/O: New `ObjectMapper` instantiation per file write (`JsonUtil`).
-    *   Network: Potential socket exhaustion in `LegDataRepositoryImpl.connectToFOS` (missing `disconnect()` in all paths).
-*   **State Management**: No TTL/Eviction on in-memory `Map` structures (`labelsMap`, `dhdHM`); risk of OOM on large inputs.
-*   **Concurrency**: `RunStateManager` lacks explicit `volatile`/`AtomicBoolean` synchronization; race condition risk on kill signals.
-*   **Scalability**: Sequential base processing in `generateSolutionSpace` limits parallel CPU utilization.
+- **Resource Exhaustion Risk**: 
+  - `HttpURLConnection` in `LegDataRepositoryImpl` lacks `disconnect()` in hot paths.
+  - `BlobClient` instantiated per-call in `AzureBlobRepositoryImpl` without pooling.
+- **GC Pressure**: Aggressive `DutyInfo::deepCopy` inside `ShortestPathComponent` loops causes high memory churn.
+- **Concurrency Flaws**: 
+  - Validation rules (`PilotRedeyeRule`) mutate shared input objects (`UnsequencedLegPairing`).
+  - Static state (`FSOUtil.accessTokenDto`) risks cross-request contamination.
+- **Algorithmic Latency**: `FSOUtil.daysBetween` uses $O(N)$ loop instead of $O(1)$ `ChronoUnit`.
+- **State Management**: No explicit TTL enforcement for stateful operations (critical if migrating to Flink).
 
 ## 4. Failure Modes & Diagnostics (RCA Triage Cheatsheet)
 
-| Symptom Category | Probable Root Cause | Source Location | Diagnostic Check |
+| Symptom | Probable Root Cause | Source Artifact | Diagnostic Action |
 | :--- | :--- | :--- | :--- |
-| **CPU Spikes / Latency** | $O(N^2)$ Graph Construction | `ConstructNetwork.java` [L130-135] | Check `buildNetwork` duration vs. `nodes.size()`. |
-| **GC Thrashing / OOM** | Deep Cloning in Loops | `ShortestPathComponent.java` [L145-150] | Monitor Heap usage; Check `identifyDhdFromBase` clone count. |
-| **Path Reconstruction Lag** | `LinkedList.add(0, ...)` | `ShortestPathComponent.java` [L45-50] | Check path length ($L$); Look for $O(L^2)$ growth. |
-| **Socket Exhaustion** | HTTP Connection Leak | `LegDataRepositoryImpl.java` [L20-45] | Check `connectToFOS` for missing `finally { conn.disconnect() }`. |
-| **Serialization Bottleneck** | Repeated `ObjectMapper` Init | `JsonUtil.java` [L10-12] | Check `saveToJsonFile` call frequency vs. CPU usage. |
-| **Hang / Non-Termination** | Race Condition on Kill Flag | `RunStateManager.java` | Verify `killRequested` is `volatile` or `AtomicBoolean`. |
-| **Out of Memory (Large Runs)** | Indefinite State Growth | `ShortestPathComponent.java` [L1-10] | Check `labelsMap` size; No TTL/Eviction policy found. |
-| **Message Stuck / Duplicates** | Manual ACK Failure | `KafkaConsumerService.java` [L42-86] | Verify `ack.acknowledge()` is called only after success. |
-| **Input Validation Failures** | Schema Mismatch | `InputValidationProcessor.java` | Check `UserInput` DTO deserialization errors. |
-
-**Immediate Action Protocol**:
-1.  **Check Metrics**: Heap usage, GC pause times, Kafka lag, HTTP connection pool status.
-2.  **Trace Logs**: Search for `KillRunException`, `InvalidUserInputException`, or `OutOfMemoryError`.
-3.  **Verify Code**: Confirm if `RunStateManager` is thread-safe and if `ObjectMapper` is reused.
-4.  **Mitigate**: Scale down concurrency (`${sb.consumer.topics.concurrency}`) or enable circuit breakers for FOS API.
+| **Socket Exhaustion / `Too many open files`** | `HttpURLConnection` leak in `connectToFOS` | `LegDataRepositoryImpl.java` | Check `conn.disconnect()` calls; monitor file descriptors. |
+| **Connection Pool Saturation / Timeout** | Dynamic `BlobClient` creation in `saveData` | `AzureBlobRepositoryImpl.java` | Verify connection reuse; check `BlobClient` lifecycle. |
+| **High CPU / GC Pauses / OOM** | `DutyInfo::deepCopy` in tight loops | `ShortestPathComponent.java` | Profile heap; look for `identifyDhdFromBase`/`updateDutyInfoList` spikes. |
+| **Data Corruption / Race Conditions** | Mutation of shared `UnsequencedLegPairing` | `PilotRedeyeRule.java` | Inspect `setRedeye(true)` calls; check thread affinity. |
+| **Incorrect Token / Tenant Leakage** | Static field mutation in `FSOUtil` | `FSOUtil.java` | Check `accessTokenDto`/`pingFederateToken` scope; verify request isolation. |
+| **Solver Latency Spikes (Long Durations)** | $O(N)$ date calculation loop | `FSOUtil.java` (`daysBetween`) | Replace loop with `ChronoUnit.DAYS.between`. |
+| **Unbounded State Growth (Flink Migration)** | Missing TTL on State Descriptors | N/A (Future) | Enforce `.enableTimeToLive()` on all `ValueStateDescriptor`. |
+| **Silent Failures / No Alerts** | `KillRunException` not caught or logged | `KafkaConsumerService.java` | Verify exception handling chain and `TeamsNotification` trigger. |
+| **Stale Data / Incorrect Schedules** | `LegDataRepositoryImpl` caching issues | `LegDataRepositoryImpl.java` | Validate query freshness and `FosUpdate` sync logic. |
+| **HTTP 500 on `/solveDebug`** | `HttpURLConnection` leak or DB timeout | `HttpSolverController.java` | Trace request ID; check `LegDataRepository` logs. |
+| **Memory Leak (Gradual)** | `BlobClient` not closed in `saveData` | `AzureBlobRepositoryImpl.java` | Monitor `BlobClient` instance count vs. GC. |
+```

@@ -16,19 +16,17 @@ sequenceDiagram
 ### Execution Trace Narration: FlightController.getOpenLegs
 
 **Overview**
-The execution begins at the `FlightController` entry point, specifically the `getOpenLegs` method located in `src/main/java/com/aa/fso/controller/FlightController.java`. This endpoint is designed to retrieve a list of unsequenced flight legs based on a specified date range and filtering criteria for positions and equipment.
+The execution begins at the `FlightController` entry point, specifically the `getOpenLegs` method located in `src/main/java/com/aa/fso/controller/FlightController.java`. This endpoint is mapped to the HTTP GET path `/openLegs` and serves as the interface for retrieving unsequenced flight legs based on specific temporal and operational criteria.
 
 **Execution Path and Data Mutations**
-Upon receiving the HTTP GET request to `/openLegs`, the controller extracts four query parameters: `sDate_start`, `sDate_end`, `positions`, and `equipment` [src/main/java/com/aa/fso/controller/FlightController.java:10-13]. The method first logs an informational message indicating the initiation of the "Open Legs API" operation [src/main/java/com/aa/fso/controller/FlightController.java:14].
+Upon receiving the request, the controller first logs the initiation of the operation via `log.info("Started Open Legs API")`, establishing an audit trail for the API invocation. The method then processes the incoming query parameters to ensure type safety and domain validity. Specifically, the string-based date inputs (`sDate_start` and `sDate_end`) are parsed into `LocalDate` objects using `LocalDate.parse()`. This transformation is critical, as it converts raw HTTP strings into structured Java time objects required by the underlying data layer. The `positions` and `equipment` lists are passed directly as `List<String>` without modification, preserving the filtering criteria provided by the client.
 
-Subsequently, the raw string inputs representing the start and end dates (`sDate_start` and `sDate_end`) undergo a critical transformation. They are parsed from their string representation into `LocalDate` objects using `LocalDate.parse()`. This step ensures that the subsequent repository logic operates on standardized temporal data types rather than raw strings [src/main/java/com/aa/fso/controller/FlightController.java:15-16]. No conditional branching occurs within this specific snippet; the flow proceeds linearly to the data retrieval phase.
+**Conditional Logic and Data Retrieval**
+No explicit conditional branching (e.g., `if/else` statements) is present within the controller logic itself; the flow proceeds linearly to the data access layer. The core business logic is delegated to the `legDataRepository`. The controller invokes `legDataRepository.getOpenLegs()`, passing the parsed `date_start`, `date_end`, `positions`, and `equipment` arguments. This repository method acts as the gatekeeper, executing the necessary database queries to filter legs that match the specified date range and equipment constraints.
 
-**Data Retrieval and Return Logic**
-With the parameters prepared, the controller delegates the core business logic to the `legDataRepository`. It invokes the `getOpenLegs` method on the repository instance, passing the parsed `date_start`, `date_end`, and the original lists for `positions` and `equipment` as arguments [src/main/java/com/aa/fso/controller/FlightController.java:17].
+**Final Return Output**
+Once the repository returns the list of `UnsequencedLeg` objects, the controller encapsulates this result within a `ResponseEntity`. The response is constructed with an HTTP status code of `OK` (200) and the retrieved list as the body. This object is immediately returned to the client, concluding the execution trace.
 
-The repository processes these filters and returns a `List<UnsequencedLeg>` containing the matching flight legs. The controller then wraps this result in a standard Spring `ResponseEntity`. The response is constructed with the retrieved list as the body and the HTTP status code set to `OK` (200) [src/main/java/com/aa/fso/controller/FlightController.java:18]. Finally, this `ResponseEntity` is returned to the client, concluding the execution trace.
-
-**Final Output**
-The method returns a `ResponseEntity` object containing:
-*   **Body**: A `List<UnsequencedLeg>` filtered by the provided date range, positions, and equipment.
-*   **Status**: `200 OK`.
+**Source Reference**
+The implementation details described above correspond to the following code segment:
+[src/main/java/com/aa/fso/controller/FlightController.java:1-13]

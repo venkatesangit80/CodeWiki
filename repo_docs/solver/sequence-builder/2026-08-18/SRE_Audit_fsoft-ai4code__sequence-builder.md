@@ -1,190 +1,181 @@
-# SRE & Performance Audit Report: Flight Schedule Optimization (FSO) Solver
+# SRE & Performance Audit Report: Flight Schedule Optimization (FSO) Service
 
 ## 1. SRE Vulnerability Summary
 
-*   **Critical Memory Leak (High Churn):** `ShortestPathComponent` performs deep cloning of `DutyInfo` objects inside tight loops (`identifyDhdFromBase`, `identifyDhdToBase`) for every potential deadhead leg, causing massive garbage generation and GC pressure.
-*   **Resource Leak (I/O):** `JsonUtil.saveToJsonFile` creates a new `ObjectMapper` instance for every single file write operation, bypassing efficient serialization caching and increasing CPU overhead.
-*   **Concurrency Hazard:** `RunStateManager` is documented as a singleton but lacks explicit synchronization or thread-safe implementation details in the provided snippet, risking race conditions in multi-threaded solver environments.
-*   **Inefficient Data Structures:** `ShortestPathComponent` uses `LinkedList` for `FlightNodes` and performs repeated `add(0, ...)` operations (O(N)) inside path reconstruction loops.
-*   **Resource Leak (Network):** `LegDataRepositoryImpl.connectToFOS` creates `HttpURLConnection` instances inside a loop without ensuring proper `disconnect()` calls in all exception paths, potentially exhausting socket pools.
-*   **Algorithmic Complexity:** `ConstructNetwork.buildNetwork` implements an $O(N^2)$ edge construction algorithm with nested loops over all nodes, which will scale poorly as flight volume increases.
-*   **Missing State TTL:** While not a Flink job, the codebase relies heavily on in-memory `Map` structures (`labelsMap`, `dhdHM`) that grow indefinitely without eviction policies, risking OutOfMemory errors during large-scale runs.
+*   **Critical Resource Leak:** `HttpURLConnection` instances are instantiated inside `LegDataRepositoryImpl.connectToFOS` without explicit `disconnect()` calls in a `finally` block, risking socket exhaustion under load.
+*   **Critical Resource Leak:** `BlobClient` instances are created dynamically inside the `saveData` loop in `AzureBlobRepositoryImpl`, failing to reuse connections or properly dispose of resources, leading to potential connection pool exhaustion.
+*   **High Memory Churn:** `DutyInfo::deepCopy` is invoked repeatedly inside tight loops (`identifyDhdFromBase`, `identifyDhdToBase`, `updateDutyInfoList`) creating massive garbage generation during the critical path of pairing generation.
+*   **Concurrency Hazard:** Validation rules (e.g., `PilotRedeyeRule`, `BaseLayover`) mutate shared state on input objects (`UnsequencedLegPairing`, `DutyInfo`) via setters like `setRedeye(true)` during read-only validation loops, causing race conditions in multi-threaded environments.
+*   **Algorithmic Inefficiency:** `FSOUtil.daysBetween` implements an $O(N)$ linear scan using `plusDays` in a loop instead of utilizing `ChronoUnit.DAYS.between`, causing significant latency for long-duration pairings.
+*   **Static State Contamination:** `FSOUtil` contains static fields (`accessTokenDto`, `pingFederateToken`) that are mutated globally, posing a risk of data leakage between concurrent requests or tenant isolation failures.
+*   **Missing TTL Configuration:** While no explicit Flink State Descriptors were found in the provided snippets, the architecture implies heavy state usage; if migrated to Flink, `enableTimeToLive()` must be enforced on all state descriptors to prevent unbounded state growth.
 
 ---
 
 ## 2. Detailed Vulnerability Analysis
 
-### A. High Memory Allocation Churn & GC Pressure
+### 2.1 Connection & Resource Leaks
 
-**Issue:** The code aggressively clones complex objects (`DutyInfo`, `UnsequencedLegPairing`) inside inner loops used for feasibility checking. This creates thousands of short-lived objects per second, triggering frequent Full GC cycles.
+**Issue:** The code creates new network connections (`HttpURLConnection`, `BlobClient`) inside processing loops without ensuring they are closed or disconnected. This prevents the underlying connection pools from being reused and can lead to `Too many open files` errors or connection timeouts.
 
-**Location:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
-**Lines:** `identifyDhdFromBase` [L145-150] & `identifyDhdToBase` [L185-190]
+**Evidence:**
+*   **File:** `src/main/java/com/aa/fso/repository/LegDataRepositoryImpl.java`
+    *   **Location:** `connectToFOS` method [L1-L45]
+    *   **Analysis:** `HttpURLConnection` is opened but `conn.disconnect()` is never called. The `try-with-resources` block wraps the `OutputStream` and `BufferedReader`, but not the `HttpURLConnection` itself.
+    ```java
+    // LEGEND: Missing disconnect()
+    HttpURLConnection conn = (HttpURLConnection) FosUpdate.openConnection();
+    // ... processing ...
+    // No conn.disconnect() here!
+    ```
 
-```java
-// Inside identifyDhdFromBase loop
-for (int f = flightLegs.size() - 1; f >= 0; f--) {
-    UnsequencedLeg flightLeg = flightLegs.get(f);
+*   **File:** `src/main/java/com/aa/fso/repository/AzureBlobRepositoryImpl.java`
+    *   **Location:** `saveData` method [L1-L20]
+    *   **Analysis:** A new `BlobClient` is built and used inside the method. While the `try-with-resources` block closes the `dataStream`, the `blobClient` itself is not closed. More critically, if this method is called frequently, it creates a new client instance every time rather than reusing a singleton or pool.
+    ```java
+    // LEGEND: Dynamic instantiation without reuse/cleanup
+    BlobClient blobClient = currentEnvClientBuilder.blobName(...).buildClient();
+    blobClient.upload(dataStream, dataBytes.length, true);
+    // blobClient is not closed explicitly, though it might be auto-closed by SDK depending on version, 
+    // relying on GC is risky for high-throughput scenarios.
+    ```
 
-    // CRITICAL: Deep copying the entire duty list for every single candidate leg
+### 2.2 High Memory Allocation Churn & GC Pressure
+
+**Issue:** The algorithm performs deep cloning of complex objects (`DutyInfo`, `UnsequencedLegPairing`) inside inner loops. This generates significant garbage, increasing GC frequency and pausing the application.
+
+**Evidence:**
+*   **File:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
+    *   **Location:** `identifyDhdFromBase` & `identifyDhdToBase` methods [L145-160, L185-200]
+    *   **Analysis:** Inside a loop iterating over potential deadhead legs, a full copy of the pairing's duty info is created.
+    ```java
+    // LEGEND: Expensive deep copy inside a loop
     UnsequencedLegPairing tempPairing = new UnsequencedLegPairing(pairing);
     tempPairing.setFlightDutyPeriods(pairing.getFlightDutyPeriods().stream()
-            .map(DutyInfo::deepCopy) // Expensive operation inside a loop
+            .map(DutyInfo::deepCopy) // <--- Heavy allocation
             .collect(Collectors.toList()));
-    
-    // ... further processing ...
-}
-```
+    ```
+    *   **Impact:** If a pairing has 5 duties and there are 10 candidate DH legs, 50 `DutyInfo` objects are cloned per iteration.
 
-**Impact:** If a base has 1000 candidate deadhead legs and 5 duties per pairing, this results in 5,000 object allocations per iteration. In a production environment with hundreds of bases, this leads to severe latency spikes.
+*   **File:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
+    *   **Location:** `updateDutyInfoList` method [L1-L15]
+    *   **Analysis:** Another instance of deep copying the entire preceding label's duty list before modification.
+    ```java
+    List<DutyInfo> currentDutyInfoList = precedingLabel.getDutyInfoList() != null
+            ? precedingLabel.getDutyInfoList().stream().map(DutyInfo::deepCopy)
+            .collect(Collectors.toList())
+            : new ArrayList<>();
+    ```
 
-### B. Inefficient Data Structures & Algorithms
+### 2.3 Concurrency Hazards & Shared Object Mutation
 
-**Issue 1:** Using `LinkedList` with `add(0, ...)` for building flight node lists.
-**Issue 2:** $O(N^2)$ complexity in network construction.
+**Issue:** Validation rules are designed to be stateless but inadvertently mutate the input domain objects (`UnsequencedLegPairing`, `DutyInfo`). In a concurrent environment (e.g., parallel streams or multiple threads processing the same pairing), this leads to data corruption.
 
-**Location:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
-**Lines:** `setFeasiblePairings` [L45-50]
+**Evidence:**
+*   **File:** `src/main/java/com/aa/fso/contractualrules/PilotRedeyeRule.java`
+    *   **Location:** `checkRedeyeDuty` method [L1-L25]
+    *   **Analysis:** The rule sets flags on the `DutyInfo` and `UnsequencedLegPairing` objects passed in.
+    ```java
+    // LEGEND: Mutating shared input state
+    dutyPeriod.setRedeye(true); // Modifies the input object
+    sequenceInfo.setRedeye(true); // Modifies the input object
+    ```
+    *   **Risk:** If `process()` is called concurrently on the same `pairing` instance, the `redeye` flag will be set incorrectly for other threads.
 
-```java
-while (precedingNodeIndex != 0 && precedingNodeIndex != -1) {
-    // ...
-    if (precedingLabel.getNode().getIndex() != 0) {
-        // O(N) operation inside a loop: LinkedList.add(0, element) shifts all elements
-        pairing.getFlightNodes().add(0, precedingLabel.getNode()); 
+*   **File:** `src/main/java/com/aa/fso/contractualrules/BaseLayover.java`
+    *   **Location:** `process` method [L1-L20]
+    *   **Analysis:** Similar pattern of reading and potentially side-effecting state (though less obvious mutation here, the pattern is established).
+
+### 2.4 Inefficient Data Structures & Algorithms
+
+**Issue:** Simple arithmetic operations are implemented using inefficient loops, resulting in $O(N)$ complexity where $O(1)$ is available.
+
+**Evidence:**
+*   **File:** `src/main/java/com/aa/fso/util/FSOUtil.java`
+    *   **Location:** `daysBetween` method [L1-L10]
+    *   **Analysis:** Uses a `while` loop with `plusDays` to calculate the difference.
+    ```java
+    // LEGEND: O(N) implementation for date difference
+    int days = 0;
+    while (startDate.isBefore(endDate) && !startDate.equals(endDate)) {
+      days++;
+      startDate = startDate.plusDays(1); // <--- Inefficient
     }
-    // ...
-}
-```
+    ```
+    *   **Recommendation:** Use `ChronoUnit.DAYS.between(start, end)`.
 
-**Location:** `src/main/java/com/aa/fso/processor/ConstructNetwork.java`
-**Lines:** `buildNetwork` [L130-135]
+### 2.5 Static State Contamination
 
-```java
-// O(N^2) Nested Loop for Edge Construction
-for (int i = 0; i < nodes.size() - 1; i++) {
-    for (int j = 1; j < nodes.size(); j++) {
-        // Logic to determine connectivity...
-    }
-}
-```
+**Issue:** Global static variables in utility classes are used to store transient state, which is unsafe in a multi-threaded web service.
 
-**Impact:**
-1.  **Reconstruction:** As path length grows, the cost of prepending to a linked list increases linearly, making path reconstruction $O(L^2)$ where $L$ is path length.
-2.  **Network Build:** With $N$ flights, the edge construction becomes quadratic. If $N=10,000$, this performs 100 million iterations just to build the graph, likely causing timeouts before optimization even starts.
-
-### C. Resource Leaks (I/O & Network)
-
-**Issue 1:** Creating `ObjectMapper` instances repeatedly.
-**Issue 2:** Potential socket leaks in HTTP connections.
-
-**Location:** `src/main/java/com/aa/fso/util/JsonUtil.java`
-**Lines:** `saveToJsonFile` [L10-12]
-
-```java
-public static void saveToJsonFile(Object object, String fileName) {
-    ObjectMapper obj = new ObjectMapper(); // NEW INSTANCE EVERY CALL
-    // ...
-}
-```
-
-**Location:** `src/main/java/com/aa/fso/repository/LegDataRepositoryImpl.java`
-**Lines:** `connectToFOS` [L20-45]
-
-```java
-public String connectToFOS(String script) throws IOException {
-    // ...
-    HttpURLConnection conn = (HttpURLConnection) FosUpdate.openConnection();
-    // ...
-    // Missing explicit conn.disconnect() in all catch blocks or finally blocks
-    // If an exception occurs before the try-with-resources block (if any), socket stays open
-}
-```
-
-**Impact:**
-1.  **JSON:** Serialization overhead increases significantly due to repeated initialization of the mapper.
-2.  **HTTP:** In high-throughput scenarios (e.g., fetching open legs for many dates), failing to disconnect can exhaust the system's ephemeral port pool or connection limits.
-
-### D. Concurrency Hazards & Singleton State
-
-**Issue:** `RunStateManager` is described as a singleton managing a kill flag. Without explicit synchronization or `volatile` keyword usage on the kill flag, concurrent threads might not see updates immediately, leading to delayed termination or race conditions.
-
-**Location:** `src/main/java/com/aa/fso/service/RunStateManager.java`
-**Context:** Class definition implies singleton behavior.
-
-```java
-public class RunStateManager {
-    // Likely missing: private volatile boolean killRequested = false;
-    // Likely missing: synchronized methods or atomic references
-}
-```
-
-**Impact:** In a distributed or multi-threaded solver, the "kill" signal might not propagate correctly, causing the application to hang or fail to terminate gracefully during scaling events.
-
-### E. Flink State TTL (Contextual Note)
-
-**Observation:** The provided codebase appears to be a batch/stream hybrid Java application (likely running on Kubernetes/Cloud), not a native Flink job. However, the `labelsMap` and `dhdHM` structures act as in-memory state stores.
-
-**Risk:** These maps (`Map<Integer, Map<Integer, Label>>`) are populated in `createLabelsMap` and held in memory until the method returns. There is no TTL or eviction mechanism. If the input data scales, these maps will grow until they cause an `OutOfMemoryError`.
-
-**Location:** `src/main/java/com/aa/fso/processor/ShortestPathComponent.java`
-**Lines:** `createLabelsMap` [L1-10]
-
-```java
-Map<Integer, Map<Integer, Label>> labelsMap = new HashMap<>();
-// ... population logic ...
-return labelsMap; // Entire map returned, held in memory
-```
+**Evidence:**
+*   **File:** `src/main/java/com/aa/fso/util/FSOUtil.java`
+    *   **Location:** Class-level fields [L1-L5]
+    *   **Analysis:**
+    ```java
+    // LEGEND: Static mutable state
+    private static AccessTokenDTO accessTokenDto;
+    private static String pingFederateToken;
+    ```
+    *   **Risk:** If `setAccessTokenDto` is called by Thread A, Thread B might read the wrong token if the timing aligns, or if the application is running multiple tenants/requests concurrently.
 
 ---
 
 ## 3. Actionable Remediations & Best Practices
 
-### Immediate Fixes (High Priority)
+### 3.1 Fix Resource Leaks (Immediate Priority)
 
-1.  **Refactor Deep Cloning Strategy:**
-    *   **Action:** Avoid `deepCopy` inside the inner loop. Instead, use a "undo" stack or a lightweight builder pattern to modify the temporary pairing, revert changes after the check, and reuse the object.
-    *   **Alternative:** If immutability is required, consider using immutable data structures (e.g., Google Guava `ImmutableList`) or a specialized object pool for `DutyInfo` lists.
-    *   **Code Change:** Move `tempPairing` creation outside the loop if possible, or implement a `cloneAndRollback` mechanism.
-
-2.  **Optimize Data Structures:**
-    *   **Action:** Replace `LinkedList` with `ArrayList` and `Collections.reverse()` for path reconstruction.
-    *   **Action:** Replace the $O(N^2)$ edge construction with a spatial index (e.g., `TreeMap` or `IntervalTree`) keyed by time/station to reduce edge lookups to $O(N \log N)$ or $O(N)$.
-
-3.  **Fix Resource Management:**
-    *   **Action:** Make `ObjectMapper` a static singleton or use dependency injection (Spring Bean) to reuse the instance.
-    *   **Action:** Wrap `HttpURLConnection` in a `try-with-resources` block or ensure `conn.disconnect()` is called in a `finally` block.
-
+1.  **LegDataRepositoryImpl:** Wrap `HttpURLConnection` in a `try-with-resources` block or ensure `disconnect()` is called in a `finally` block.
     ```java
-    // Example Fix for JSON Util
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-
-    public static void saveToJsonFile(Object object, String fileName) {
-        try (FileWriter fileWriter = new FileWriter(fileName)) {
-            OBJECT_MAPPER.writeValue(fileWriter, object);
-        } catch (IOException e) {
-            // handle
-        }
+    try (HttpURLConnection conn = (HttpURLConnection) FosUpdate.openConnection()) {
+        // ... logic
+    } finally {
+        if (conn != null) conn.disconnect(); // Explicit safety
+    }
+    ```
+2.  **AzureBlobRepositoryImpl:** Refactor to use a singleton `BlobContainerClient` or a connection pool. Do not instantiate `BlobClient` inside the hot path.
+    ```java
+    // Recommended: Inject a pre-configured BlobContainerClient via Spring Context
+    private final BlobContainerClient containerClient;
+    public void saveData(...) {
+        BlobClient blobClient = containerClient.getBlobClient(fileName);
+        // ... upload
     }
     ```
 
-4.  **Strengthen Concurrency:**
-    *   **Action:** Ensure `RunStateManager` uses `AtomicBoolean` for the kill flag and `volatile` for visibility across threads.
+### 3.2 Reduce Memory Churn
 
-### Long-Term Architectural Improvements
+1.  **Avoid Deep Copies in Loops:** Instead of cloning the entire `DutyInfo` list, create a new `UnsequencedLegPairing` and only clone the specific `DutyInfo` objects that need modification, or use a builder pattern that allows incremental updates.
+2.  **Object Pooling:** If deep copying is unavoidable for logic correctness, consider using an object pool for `DutyInfo` and `Node` objects to reduce GC pressure.
+3.  **Lazy Evaluation:** Defer the creation of temporary pairings until absolutely necessary (e.g., only after basic time feasibility checks pass).
 
-1.  **Implement State TTL/Eviction:**
-    *   If this logic is moved to Flink or a long-running service, replace `HashMap` with `ConcurrentHashMap` combined with a TTL policy (e.g., using Caffeine cache with expiration) for `labelsMap` entries to prevent memory bloat.
+### 3.3 Eliminate Concurrency Hazards
 
-2.  **Parallel Processing:**
-    *   The `generateSolutionSpace` method iterates over bases sequentially. Refactor this to use a `ForkJoinPool` or `CompletableFuture` to process multiple bases in parallel, utilizing available CPU cores effectively.
+1.  **Immutable Validation:** Refactor validation rules (`PilotRedeyeRule`, `BaseLayover`, etc.) to be purely functional. They should accept inputs and return a boolean result without modifying the input objects.
+    *   *Refactoring Strategy:* Remove `setRedeye(true)` calls. Instead, maintain a local `Map<String, Boolean>` or a custom result object to track state for the current validation pass.
+2.  **Thread Safety:** Ensure that `UnsequencedLegPairing` objects are not shared across threads during the validation phase. If they are, create a defensive copy before passing to validators.
 
-3.  **Streaming/Chunking:**
-    *   For `createLabelsMap`, process nodes in batches rather than loading the entire graph into memory at once. Stream the topological sort results to keep memory footprint constant relative to the batch size.
+### 3.4 Algorithmic Optimization
 
-4.  **Monitoring & Observability:**
-    *   Add metrics for:
-        *   Number of `DutyInfo` clones per second.
-        *   Heap usage growth during `buildNetwork`.
-        *   HTTP connection pool utilization.
-    *   Implement circuit breakers for external FOS API calls to prevent cascading failures.
+1.  **Replace `daysBetween`:**
+    ```java
+    // Replace the loop with:
+    long days = ChronoUnit.DAYS.between(startDateTime.toLocalDate(), endDateTime.toLocalDate());
+    ```
+2.  **Pre-compute Static Data:** Ensure `StationTimeAdjust` and `HotelCost` maps are loaded once at startup (Singleton/Cache) rather than re-loading or re-processing inside the `setFeasiblePairings` loop.
+
+### 3.5 Flink State Management (Future Proofing)
+
+If this codebase is migrated to Apache Flink:
+1.  **Audit State Descriptors:** Search for `ValueStateDescriptor`, `MapStateDescriptor`, etc.
+2.  **Enforce TTL:** Immediately call `.enableTimeToLive(Time.hours(24))` (or appropriate duration) on every state descriptor.
+    ```java
+    ValueStateDescriptor<Pairing, ?> descriptor = new ValueStateDescriptor<>("pairing-state", Pairing.class);
+    descriptor.enableTimeToLive(Time.hours(24)); // <--- CRITICAL
+    ```
+3.  **Cleanup:** Ensure `CleanupConfig` is set to remove stale state automatically.
+
+### 3.6 Static State Cleanup
+
+1.  **Remove Static Fields:** Move `accessTokenDto` and `pingFederateToken` into a request-scoped bean or pass them as arguments.
+2.  **Dependency Injection:** Use Spring's `@Scope("request")` or similar mechanisms to ensure thread-local isolation for sensitive data.
