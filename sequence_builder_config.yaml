@@ -32,7 +32,7 @@ output:
 repos:
 - branch: main
   local_path: /Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25
-  repo_id: fsoft-ai4code/sequence-builder
+  repo_id: AAInternal/Sequence_Builder
   tech: solver
 vector_store:
   backend: sqlite
