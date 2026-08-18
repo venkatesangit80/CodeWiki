@@ -79,6 +79,9 @@ def get_index():
     
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- Mermaid.js for Diagrams -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 
     <style>
         :root {
@@ -675,6 +678,49 @@ def get_index():
                         setLoading(false);
                     });
             };
+
+            useEffect(() => {
+                if (window.mermaid && !loading && docContent) {
+                    try {
+                        // Initialize mermaid
+                        window.mermaid.initialize({
+                            startOnLoad: false,
+                            theme: 'dark',
+                            securityLevel: 'loose',
+                            themeVariables: {
+                                background: '#0d1117',
+                                primaryColor: '#1f2937',
+                                primaryTextColor: '#f3f4f6',
+                                lineColor: '#3b82f6'
+                            }
+                        });
+
+                        // Replace all language-mermaid pre blocks with div.mermaid
+                        const wrappers = document.querySelectorAll(".markdown-wrapper pre code.language-mermaid");
+                        let replaced = false;
+                        
+                        wrappers.forEach(el => {
+                            const pre = el.parentElement;
+                            const div = document.createElement("div");
+                            div.className = "mermaid";
+                            // Decode HTML entities (e.g. &gt;, &lt;) to raw mermaid text
+                            const temp = document.createElement("textarea");
+                            temp.innerHTML = el.innerHTML;
+                            div.textContent = temp.value;
+                            pre.replaceWith(div);
+                            replaced = true;
+                        });
+                        
+                        if (replaced) {
+                            window.mermaid.run({
+                                nodes: document.querySelectorAll(".mermaid")
+                            });
+                        }
+                    } catch (e) {
+                        console.error("Mermaid error:", e);
+                    }
+                }
+            }, [docContent, loading]);
 
             return (
                 <div className="app-container">
