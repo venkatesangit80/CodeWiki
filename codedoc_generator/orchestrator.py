@@ -528,6 +528,48 @@ class GeneratorOrchestrator:
             doc = await self.llm_client.generate_completion(system_prompt, user_content)
             return doc
 
+    async def generate_rca_context_prompt(self, sre_audit_doc: str, hldd_data: Dict[str, str]) -> str:
+        """Generates a token-optimized, machine-triage-friendly SRE observer prompt for live RCA."""
+        logger.info("Generating RCA Context Prompt Document")
+        is_fallback = isinstance(self.llm_client, PythonFallbackClient)
+        
+        if is_fallback:
+            # Fallback static prompt builder
+            doc = (
+                "# RCA Context Prompt: Live Incident Analysis Guide\n\n"
+                "## 1. System Topology & Tech Stack\n"
+                f"{hldd_data.get('tech_stack', '*Not available*')}\n\n"
+                "## 2. Architectural Advantages & Limitations\n"
+                "- **Stateless processing:** Highly scalable processing model.\n"
+                "- **Dependency footprint:** External integrations with Kafka/Azure are boundaries.\n\n"
+                "## 3. High-Priority Failure Modes & Audit Warnings\n"
+                "The following code issues have been identified and must be considered during live RCA triage:\n"
+                "- Verify Flink State TTL configuration in properties vs. Java code instantiation.\n"
+                "- Check GC and memory pressure indicators for potential heap leaks under high throughput.\n"
+                "- Ensure connection timeouts and retries are bounded to prevent thread starvation.\n"
+            )
+            return doc
+        else:
+            system_prompt = (
+                "You are an SRE Architect designing context prompts for live autonomous incident observers.\n"
+                "Generate a highly structured, token-optimized, and machine-comprehensible 'RCA Context Prompt' markdown document.\n"
+                "This document will be used directly as a system context prompt for an AI agent performing real-time Root Cause Analysis (RCA) on the system.\n"
+                "Structure the document exactly as follows:\n"
+                "1. **System Blueprint & Tech Stack**: Extremely concise summary of key frameworks, source systems, and sink systems.\n"
+                "2. **Architectural Advantages & Safeguards**: Strengths (e.g., fault-tolerance features, retry settings, logging filters).\n"
+                "3. **Architectural Limitations**: Hard boundaries (e.g., parallelism limits, message serialization overheads).\n"
+                "4. **Failure Modes & Diagnostics (RCA Triage Cheatsheet)**: Map known configuration/code vulnerabilities to potential incident symptoms (e.g., CPU Spikes -> [File.java], Checkpoint Failures -> State TTL issue). Keep descriptions concise and citation-focused."
+            )
+            
+            user_content = (
+                "Compile the RCA Context Prompt based on the following architectural metadata and SRE audit results:\n\n"
+                f"### High-Level Tech Stack:\n{hldd_data.get('tech_stack', '')}\n\n"
+                f"### SRE Audit Findings:\n{sre_audit_doc}\n"
+            )
+            
+            doc = await self.llm_client.generate_completion(system_prompt, user_content)
+            return doc
+
     async def generate_lldd_module(self, module_name: str, symbols: List[Dict[str, Any]]) -> Dict[str, str]:
         """Runs LLDD generation for a module. Synchronously generates structure, but uses LLM for details if active."""
         logger.info(f"Generating LLDD module: {module_name}")

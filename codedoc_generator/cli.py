@@ -221,6 +221,13 @@ def _run_generation(config: GeneratorConfig, repo_cfg: RepoConfig, output_dir_ov
         f.write(sre_audit_doc)
     logger.info(f"Written SRE Audit to {sre_audit_path}")
     
+    # Generate RCA Context Prompt Document
+    rca_prompt_doc = loop.run_until_complete(orchestrator.generate_rca_context_prompt(sre_audit_doc, hldd_data))
+    rca_path = os.path.join(config.output.output_dir, f"RCA_Context_Prompt_{repo_id.replace('/', '__')}.md")
+    with open(rca_path, "w") as f:
+        f.write(rca_prompt_doc)
+    logger.info(f"Written RCA Context Prompt to {rca_path}")
+    
     for feat_name, doc in feature_docs:
         feat_file = f"Feature_{feat_name.replace('.', '_')}.md"
         feat_path = os.path.join(config.output.output_dir, feat_file)
