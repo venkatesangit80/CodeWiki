@@ -8,6 +8,7 @@ class RepoConfig(BaseModel):
     branch: Optional[str] = "main"
     local_path: Optional[str] = None  # If already cloned/local
     url: Optional[str] = None
+    tech: Optional[str] = "generic"
 
 class GitHubConfig(BaseModel):
     auth_token_env: str = "GITHUB_PAT"

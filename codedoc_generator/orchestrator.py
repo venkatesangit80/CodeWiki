@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from typing import Dict, List, Any, Optional, Set
 
 # Local imports
@@ -232,9 +233,8 @@ class GeneratorOrchestrator:
             for word in file_keywords:
                 if word in content:
                     egress_set.add(f"File System Writes / Local I/O operations in `{r.file_path}`")
-            for word in xpress_keywords:
-                if word in content or word in file_name:
-                    egress_set.add(f"In-Process Native C++ Execution (FICO Xpress Optimizer JNI calls in `{r.file_path}`)")
+            if re.search(r'\bxpress\b|\bxpr[sb]\b|dashoptimization', content) or re.search(r'\bxpress\b|\bxpr[sb]\b|dashoptimization', file_name):
+                egress_set.add(f"In-Process Native C++ Execution (FICO Xpress Optimizer JNI calls in `{r.file_path}`)")
                     
         return {
             "ingress": ingress if ingress else ["*No explicit routes/CLI main triggers detected*"],
@@ -367,9 +367,9 @@ class GeneratorOrchestrator:
             
         else:
             key_chunks = self.vector_store.retrieve(
-                "performance bottlenecks, nested loops, blocking locks, thread pool concurrency, native memory JNI C++ C allocation, resource release close dispose free leak, controller ingress egress endpoints",
+                "performance bottlenecks, nested loops, blocking locks, thread pool concurrency, native memory JNI C++ C allocation, resource release close dispose free leak, controller ingress egress endpoints, connection idle timeout, KafkaConfig, connections.max.idle.ms, liveness probe health check webapp.yaml, singleton state contamination, volatile kill flags, concurrent requests",
                 {"repo_id": self.config.repos[0].repo_id},
-                top_k=30
+                top_k=40
             )
             code_context_blocks = []
             for record, _ in key_chunks:
@@ -381,29 +381,59 @@ class GeneratorOrchestrator:
             system_prompt = (
                 "You are a principal software architect. You are writing the final 'Architecture & Operations Synthesis' report for a system.\n"
                 "Analyze the technical stack, data flows, and performance characteristics with extreme technical accuracy and professional tone.\n"
-                "Specifically audit the code for:\n"
-                "1. Resource leaks and native memory allocation JNI risks (e.g. instantiating native objects like XPRB without explicit disposal/closure).\n"
-                "2. Concurrency hazards, thread lock bottlenecks, static cache leaks, or race conditions.\n"
+                "Specifically audit the code and configuration for:\n"
+                "1. Resource leaks and native memory allocation JNI/C++ risks: Audit for instances where native dynamic objects are allocated but not explicitly disposed or closed in finally blocks. Note: Do not flag native dependencies, database backends, or off-heap state stores that are managed entirely at the framework level as user-code leaks. Only report leaks where the application source code explicitly allocates native/off-heap resources or unmanaged dynamic connections and fails to release them.\n"
+                "2. Concurrency hazards, thread safety risks, and singleton state contamination: Audit for shared mutable instances or singleton services that manage request/session state in instance variables without proper thread isolation.\n"
                 "3. Ingestion/Loop inefficiencies, specifically auditing for linear scans (O(N) search loops over arrays/lists) performed per record within a streaming environment instead of map-based lookup caching.\n"
                 "4. Date/Timezone comparison vulnerabilities, specifically auditing for the usage of simple equality operators (==) or Objects.equals() on date objects/strings (e.g. DateTimeInfo) which can fail due to timezone notation mismatch (e.g., '+00:00' vs 'Z') or differing precision.\n"
                 "5. Silent logic fallbacks, specifically auditing for catch-blocks or conditional branches that silently default critical state parameters (e.g., collapsing original indices/timestamps to current/latest ones) without throwing exceptions, logging errors, or emitting warning diagnostics.\n"
+                "6. Silent connection drops: Audit configuration settings for connection idle limits (e.g. connections.max.idle.ms) to verify connection recycling policies match broker/event hub idle timeouts.\n"
+                "7. Liveness probe and monitoring failures: Audit deployment configurations for health checks or liveness probe intervals that might prematurely kill long-running batch operations or fail to report native/blocked thread hangs.\n"
+                "8. Core DFD Risk Overlay: In the Core Data Flow Diagram (DFD) generated in Section 1, you MUST overlay and visually highlight any nodes representing classes or components that contain the High or Critical severity vulnerabilities identified in your Section 3 audit. Style these risk nodes using custom Mermaid styles (e.g., style NodeName fill:#ffcccc,stroke:#ff3333,stroke-width:2px) so they are immediately visible.\n"
+                "9. Performance Issues Summary: You MUST include a distinct section titled 'Performance Issues Summary' that lists a concise, 1-line bullet point summary for every performance issue, JNI leak, or technical vulnerability identified in your audit.\n"
                 "Be detailed, descriptive, and reference code symbols/files precisely.\n"
                 "CRITICAL MERMAID SYNTAX RULE: If you generate any Mermaid diagrams, you MUST wrap any node labels containing parenthesis, brackets, or other special characters in double quotes to prevent rendering syntax errors (e.g. J[\"OptModel (JNI)\"] or K[\"Output Service\"])."
             )
             
             user_content = (
                 f"Write a comprehensive professional analysis based on these codebase findings and source code definitions:\n\n"
-                f"### Code Context Summary (Key Files):\n{code_context_str}\n\n"
+                f"### Code Context Summary (Key Files & Configuration):\n{code_context_str}\n\n"
                 f"### System Ingress (Entry points):\n{json.dumps(flow_data['ingress'], indent=2)}\n\n"
                 f"### System Egress (Outgoing dependencies):\n{json.dumps(flow_data['egress'], indent=2)}\n\n"
                 "Include sections on:\n"
-                "1. Core Data Flow Diagram (DFD) and its execution routing.\n"
-                "2. Detailed Ingress and Egress interface boundaries.\n"
-                "3. Inferred Performance Challenges (specifically audit the code files, identifying CPU bottlenecks, JNI/native heap leaks, blocking thread pools, database locks, or external request delays).\n"
+                "1. Core Data Flow Diagram (DFD) that visually highlights and colors the high-severity risk nodes/components matching the findings from Section 3.\n"
+                "2. Performance Issues Summary: A bulleted list of 1-line summaries for each identified issue (including state manager thread safety, connection timeouts, liveness probes, native leaks, and loop/scan bottlenecks).\n"
+                "3. Detailed Ingress and Egress interface boundaries.\n"
+                "4. Inferred Performance Challenges (specifically audit the code files, identifying CPU bottlenecks, JNI/native heap leaks, blocking thread pools, database locks, or external request delays).\n"
                 "Make the explanation thorough and clear."
             )
             
             llm_narrative = await self.llm_client.generate_completion(system_prompt, user_content)
+            
+            # Post-process to fix any unquoted Mermaid node labels containing parentheses/special characters
+            # e.g., L[OptModel (JNI)] -> L["OptModel (JNI)"]
+            sanitized_lines = []
+            in_mermaid = False
+            for line in llm_narrative.splitlines():
+                if "```mermaid" in line:
+                    in_mermaid = True
+                elif in_mermaid and "```" in line:
+                    in_mermaid = False
+                
+                if in_mermaid:
+                    match = re.search(r'(\b\w+)(\[|\(|\{)', line)
+                    if match:
+                        node_id = match.group(1)
+                        open_char = match.group(2)
+                        start_idx = match.start(2)
+                        close_char = ']' if open_char == '[' else ')' if open_char == '(' else '}'
+                        end_idx = line.rfind(close_char)
+                        if end_idx != -1 and end_idx > start_idx:
+                            label = line[start_idx+1:end_idx]
+                            if label and not label.startswith('"'):
+                                line = line[:start_idx+1] + f'"{label}"' + line[end_idx:]
+                sanitized_lines.append(line)
+            llm_narrative = "\n".join(sanitized_lines)
             
             doc = (
                 "# Architecture & Operations Synthesis Document\n\n"
@@ -414,6 +444,88 @@ class GeneratorOrchestrator:
                 f"{boundary_mermaid}\n\n"
                 f"{llm_narrative}\n"
             )
+            return doc
+
+    async def generate_sre_audit(self) -> str:
+        """Generates a separate stateful SRE & Performance Audit Document."""
+        logger.info("Generating SRE & Performance Audit Document")
+        res = self.vector_store.retrieve("", {"repo_id": self.config.repos[0].repo_id}, top_k=10000)
+        
+        is_fallback = isinstance(self.llm_client, PythonFallbackClient)
+        
+        if is_fallback:
+            # Fallback scanner heuristics
+            issues = []
+            for r, _ in res:
+                content = r.chunk_text
+                file_name = r.file_path
+                
+                # Check for state descriptors without enableTimeToLive
+                if "StateDescriptor" in content and "enableTimeToLive" not in content:
+                    issues.append(f"- **State TTL Risk in `{file_name}`**: State descriptor initialized but no explicit `enableTimeToLive` found in this chunk. Ensure state cleanups are enabled.")
+                
+                # Check for deepCopy calls (gc overhead / memory pressure)
+                if "deepCopy" in content or "SpecificData" in content:
+                    issues.append(f"- **Object Cloning Overhead in `{file_name}`**: Usage of `deepCopy` or `SpecificData` found. Ensure this is not executed per-record in high-throughput streams to avoid GC pressure.")
+                
+                # Check for locks
+                if "synchronized" in content or "lock" in content.lower():
+                    issues.append(f"- **Thread Locking / Synchronisation in `{file_name}`**: Synchronization block or manual locking lock found. Check for deadlocks or blocking threads.")
+                
+                # Check for database clients or connections initialized per-record
+                if "class " not in content and ("MongoClients.create" in content or "new MongoClient" in content):
+                    issues.append(f"- **Connection Instantiation Risk in `{file_name}`**: Dynamic creation of MongoDB client. Connection-heavy clients should be cached in `open()` and released in `close()`.")
+            
+            unique_issues = sorted(list(set(issues)))[:15]
+            issues_str = "\n".join(unique_issues) if unique_issues else "- *No high-severity SRE configuration or static code risks detected via heuristics.*"
+            
+            doc = (
+                "# SRE & Performance Audit Document\n\n"
+                "This document performs a stateful audit of the codebase for memory leaks, connection leaks, and performance bottlenecks.\n\n"
+                "## 1. Executive Summary & Telemetry\n\n"
+                "- **Audited Components:** Under parent directories\n"
+                "- **Scope:** High-throughput streaming operations, state lifecycle, connection scoping\n\n"
+                "## 2. Identified Vulnerabilities & Bottlenecks\n\n"
+                f"{issues_str}\n\n"
+                "## 3. General SRE Recommendations\n\n"
+                "1. **State TTL Configuration:** Always configure explicit TTL values for state descriptors (ValueState, MapState, ListState) using `StateTtlConfig` to prevent off-heap/heap state accumulation.\n"
+                "2. **Connection Scoping:** Ensure database connections, HTTP clients, or messaging handles are initialized once in lifecycle `open()` methods and closed in `close()` methods.\n"
+                "3. **Minimize Object Cloning:** Avoid calling Avro `deepCopy()` or generic Kryo cloning inside high-frequency processing loops (like `flatMap` or `map`).\n"
+            )
+            return doc
+        else:
+            sre_chunks = self.vector_store.retrieve(
+                "state descriptor enableTimeToLive stateTtlConfig, close connection dispose client, static collection cache thread local, deepCopy SpecificData cloneWrapper, linear scan nested loops synchronized lock, MongoClient, connections.max.idle.ms, liveness probe health check",
+                {"repo_id": self.config.repos[0].repo_id},
+                top_k=40
+            )
+            code_context_blocks = []
+            for record, _ in sre_chunks:
+                symbol_name = record.metadata.get("name", "unknown")
+                code_context_blocks.append(f"--- File: {record.file_path} (Symbol: {symbol_name}) ---\n{record.chunk_text}\n")
+            code_context_str = "\n".join(code_context_blocks)
+            
+            system_prompt = (
+                "You are an expert SRE and JVM/Flink performance engineer. Perform a deep, thorough SRE & Performance Audit of the codebase.\n"
+                "Analyze the provided code and configuration snippets. Specifically search for and report on:\n"
+                "1. Flink State TTL leaks: Audit for Flink state descriptors (ValueStateDescriptor, MapStateDescriptor, etc.) initialized without calling enableTimeToLive() on them.\n"
+                "2. High memory allocation churn & GC pressure: Audit for expensive dynamic cloning (e.g. SpecificData.get().deepCopy), nested collection allocations, or excessive object creation inside map/flatmap/filter functions.\n"
+                "3. Concurrency hazards / Singleton state contamination: Audit for shared mutable instance variables in stateless operators, or static/thread-local cache leaks.\n"
+                "4. Unclosed resources: Check if MongoClient, database handles, HTTP clients, or native buffers are dynamically instantiated inside processing loops instead of open()/close() lifecycle methods.\n"
+                "5. Inefficient data structures: Check for O(N) linear scans on collections inside streaming operators.\n"
+                "Format the response in professional markdown with clear headings, file citations with line ranges in brackets (e.g., [FileName.java:L123-145]), and actionable recommendations."
+            )
+            
+            user_content = (
+                f"Perform a detailed SRE & Performance Audit based on the following codebase context:\n\n"
+                f"### Codebase Context:\n{code_context_str}\n\n"
+                "Generate the report sections:\n"
+                "1. SRE Vulnerability Summary: Bullet points with 1-line summaries of each issue found.\n"
+                "2. Detailed Vulnerability Analysis (with code snippets and file citations).\n"
+                "3. Actionable Remediations & Best Practices."
+            )
+            
+            doc = await self.llm_client.generate_completion(system_prompt, user_content)
             return doc
 
     async def generate_lldd_module(self, module_name: str, symbols: List[Dict[str, Any]]) -> Dict[str, str]:
