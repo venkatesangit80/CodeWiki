@@ -141,6 +141,13 @@ def get_index():
             height: 100%;
             flex-shrink: 0;
             z-index: 10;
+            transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .sidebar.collapsed {
+            width: 0px;
+            overflow: hidden;
+            border-right: none;
         }
 
         .sidebar-header {
@@ -485,6 +492,18 @@ def get_index():
                         <polyline points="9 18 15 12 9 6"></polyline>
                     </svg>
                 ),
+                "chevron-left": (
+                    <svg viewBox="0 0 24 24" width={size} height={size} stroke="currentColor" strokeWidth="2.5" fill="none" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                        <polyline points="15 18 9 12 15 6"></polyline>
+                    </svg>
+                ),
+                "menu": (
+                    <svg viewBox="0 0 24 24" width={size} height={size} stroke="currentColor" strokeWidth="2.5" fill="none" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                        <line x1="3" y1="12" x2="21" y2="12"></line>
+                        <line x1="3" y1="6" x2="21" y2="6"></line>
+                        <line x1="3" y1="18" x2="21" y2="18"></line>
+                    </svg>
+                ),
                 "folder": (
                     <svg viewBox="0 0 24 24" width={size} height={size} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className={className} style={{color: '#60a5fa'}}>
                         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
@@ -608,6 +627,7 @@ def get_index():
             const [tech, setTech] = useState("");
             const [comp, setComp] = useState("");
             const [date, setDate] = useState("");
+            const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
 
             useEffect(() => {
                 fetch("/api/tree")
@@ -725,10 +745,17 @@ def get_index():
             return (
                 <div className="app-container">
                     {/* Left Sidebar */}
-                    <div className="sidebar">
+                    <div className={`sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`}>
                         <div className="sidebar-header">
                             <Icon name="book-open" size={22} className="text-blue-500" />
-                            <h1>Everops Wiki Explorer</h1>
+                            <h1 style={{ marginRight: '0.5rem' }}>Everops Wiki Explorer</h1>
+                            <button 
+                                onClick={() => setIsSidebarCollapsed(true)} 
+                                style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', marginLeft: 'auto', display: 'flex', alignItems: 'center' }}
+                                title="Collapse Sidebar"
+                            >
+                                <Icon name="chevron-left" size={18} />
+                            </button>
                         </div>
                         
                         <div className="search-container">
@@ -767,6 +794,15 @@ def get_index():
                             <>
                                 <div className="content-header">
                                     <div className="doc-title-container">
+                                        {isSidebarCollapsed && (
+                                            <button 
+                                                onClick={() => setIsSidebarCollapsed(false)} 
+                                                style={{ background: 'none', border: 'none', color: '#60a5fa', cursor: 'pointer', marginRight: '0.75rem', display: 'flex', alignItems: 'center' }}
+                                                title="Expand Sidebar"
+                                            >
+                                                <Icon name="menu" size={20} />
+                                            </button>
+                                        )}
                                         <Icon name="file-text" size={20} className="text-blue-400" />
                                         <span style={{ fontWeight: 600 }}>
                                             {selectedPath.split("/").pop()}
@@ -794,7 +830,16 @@ def get_index():
                                 </div>
                             </>
                         ) : (
-                            <div className="placeholder-view">
+                            <div className="placeholder-view" style={{ position: 'relative' }}>
+                                {isSidebarCollapsed && (
+                                    <button 
+                                        onClick={() => setIsSidebarCollapsed(false)} 
+                                        style={{ position: 'absolute', top: '1.5rem', left: '2rem', background: 'none', border: 'none', color: '#60a5fa', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+                                        title="Expand Sidebar"
+                                    >
+                                        <Icon name="menu" size={22} />
+                                    </button>
+                                )}
                                 <div className="placeholder-logo">📚</div>
                                 <h2>Everops Wiki Document Viewer</h2>
                                 <p>Select any document from the sidebar to start reading.</p>
