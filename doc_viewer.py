@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from typing import List, Dict, Any
 
-app = FastAPI(title="CodeWiki Document Viewer")
+app = FastAPI(title="Everops Wiki Document Viewer")
 
 WORKSPACE_DIR = Path(__file__).parent.resolve()
 REPO_DOCS_DIR = WORKSPACE_DIR / "repo_docs"
@@ -58,7 +58,7 @@ def get_index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CodeWiki Interactive Viewer</title>
+    <title>Everops Wiki Interactive Viewer</title>
     <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -647,7 +647,7 @@ def get_index():
                     setDate(parts[2]);
                 } else {
                     setTech("General");
-                    setComp("CodeWiki");
+                    setComp("Everops Wiki");
                     setDate("");
                 }
 
@@ -728,7 +728,7 @@ def get_index():
                     <div className="sidebar">
                         <div className="sidebar-header">
                             <Icon name="book-open" size={22} className="text-blue-500" />
-                            <h1>CodeWiki Explorer</h1>
+                            <h1>Everops Wiki Explorer</h1>
                         </div>
                         
                         <div className="search-container">
@@ -796,7 +796,7 @@ def get_index():
                         ) : (
                             <div className="placeholder-view">
                                 <div className="placeholder-logo">📚</div>
-                                <h2>CodeWiki Document Viewer</h2>
+                                <h2>Everops Wiki Document Viewer</h2>
                                 <p>Select any document from the sidebar to start reading.</p>
                             </div>
                         )}
