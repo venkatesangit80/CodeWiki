@@ -213,212 +213,103 @@ flowchart TD
 # Low-Level Design Document (LLDD): Sequence Builder Module
 
 ## 1. Overview
-This document details the internal architecture, class structures, and behavioral logic of the `Sequence Builder` module. The system is designed to automate the generation of pilot pairing sequences while adhering to complex contractual rules (FAR 117, FAR 121), legal constraints, and operational requirements. It integrates with external systems via REST APIs, Azure Blob Storage, and Kafka for asynchronous processing.
+This document details the internal architecture, class structures, and behavioral logic of the `SequenceBuilder` module. The system is designed to automate the generation of pilot sequences (pairings) while adhering to complex contractual rules (FAR 117, FAR 121, WOCL, etc.) and operational constraints. It integrates with external systems via REST APIs (PingFederate, QLA), manages data persistence through Azure Blob Storage, and utilizes an optimization engine (Xpress) for sequence construction.
 
 The design emphasizes separation of concerns:
-*   **DTOs**: Data transfer objects for API boundaries.
-*   **Models**: Internal domain entities representing the optimization graph.
-*   **Services**: Business logic orchestration.
-*   **Repositories**: Abstraction over data persistence (Azure Blob, External APIs).
-*   **Rules**: Encapsulated logic for legality checks.
+- **DTOs**: Data transfer objects for API contracts.
+- **Models**: Internal domain entities representing the optimization graph.
+- **Repositories**: Abstraction layers for data access (Blob, Input/Output).
+- **Services**: Business logic orchestration.
+- **Rules**: Encapsulated logic for regulatory compliance.
 
 ---
 
-## 2. Core Domain Objects & DTOs
+## 2. Core Architecture & Entry Point
 
-### 2.1 Data Transfer Objects (DTOs)
-These classes serve as the contract between the API layer and internal processing logic. They are typically immutable or use standard JavaBean patterns with Jackson annotations for serialization.
+### 2.1 Application Bootstrapping
+**Class:** `SequenceBuilderApplication`
+- **Location:** [`src/main/java/com/aa/fso/SequenceBuilderApplication.java:L12-12`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/SequenceBuilderApplication.java#L12-12)
+- **Behavior:** Serves as the Spring Boot entry point. It initializes the application context, enabling component scanning for all services, repositories, and controllers. No business logic resides here; it solely manages the lifecycle of the Spring container.
 
-#### `SequenceBuilderApplication`
-*   **Location:** [`src/main/java/com/aa/fso/SequenceBuilderApplication.java:L12-12`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/SequenceBuilderApplication.java#L12-12)
-*   **Behavior:** The Spring Boot entry point. Initializes the application context and enables auto-configuration for Kafka, Security, and Azure services.
-*   **Implementation Note:** Uses `@SpringBootApplication` to bootstrap the microservice.
+### 2.2 Configuration Management
+**Class:** `AppProperties`
+- **Location:** [`src/main/java/com/aa/fso/properties/AppProperties.java:L14-14`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/properties/AppProperties.java#L14-14)
+- **Behavior:** Binds external configuration properties (from `application.properties` or environment variables) to Java objects. It exposes nested configurations for Kafka, Azure Blob Storage, and Teams Notifications.
+- **Key Fields:**
+  - `teamsNotifications`: Configuration for Microsoft Teams alerting.
+  - `azure`: Connection strings and container names.
+  - `kafka`: Bootstrap servers and topic names.
 
-#### `Constants`
-*   **Location:** [`src/main/java/com/aa/fso/Constants.java:L3-3`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/Constants.java#L3-3)
-*   **Behavior:** Holds static final values for file extensions, default time formats, and magic numbers used across the module.
-*   **Usage:** Prevents "magic string" errors by centralizing configuration values.
-
-#### `DateTimeDTO`, `SequenceKeyDTO`, `SolverResponseDTO`, etc.
-*   **Locations:** Various under `dto/` package.
-*   **Behavior:** These classes act as thin wrappers for JSON payloads.
-    *   `DateTimeDTO`: Wraps date/time logic to ensure consistent ISO-8601 formatting during deserialization.
-    *   `SolverResponseDTO`: Aggregates the final output of the optimization engine, including success status, solution ID, and error messages.
-    *   `SnapshotSolutionRequestInputDTO`: Captures the user's input parameters required to trigger a new solving session.
-*   **Error Handling:** Deserialization failures (e.g., invalid date format) are caught by global exception handlers, converting them into `400 Bad Request` responses.
-
-#### `FlightLegDTO`, `EmployeeActivityDTO`, `StudentScheduleDTO`
-*   **Locations:** `dto/` package.
-*   **Behavior:** Represent specific segments of the scheduling problem.
-    *   `FlightLegDTO`: Contains origin, destination, departure/arrival times, and aircraft type.
-    *   `EmployeeActivityDTO`: Tracks an employee's historical or projected activities (rest, duty, vacation).
-*   **Design Pattern:** Follows the **Data Mapper** pattern where these DTOs are transformed into internal `Model` objects before processing.
-
-#### `LocalDateSerializer` / `LocalDateDeserializer`
-*   **Locations:** `dto/` and `qlacheck/request/` packages.
-*   **Behavior:** Custom Jackson serializers/deserializers to handle `java.time.LocalDate` and `LocalDateTime`.
-*   **Implementation Detail:** Ensures that dates are parsed strictly according to the configured pattern (e.g., `yyyy-MM-dd`) to avoid timezone ambiguity issues common in legacy systems.
+**Class:** `SecurityConfig`
+- **Location:** [`src/main/java/com/aa/fso/config/SecurityConfig.java:L16-16`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/config/SecurityConfig.java#L16-16)
+- **Behavior:** Configures Spring Security to handle OAuth2 Bearer token authentication. It defines the filter chain to validate tokens issued by PingFederate before allowing access to protected endpoints.
 
 ---
 
-## 3. Domain Models & Graph Structures
+## 3. Data Transfer Objects (DTOs)
 
-The core optimization logic relies on a graph-based representation of the scheduling problem.
+The module uses a strict set of DTOs to decouple internal processing from external API contracts. These classes are typically POJOs (Plain Old Java Objects) annotated with Jackson annotations for serialization.
 
-#### `Network`, `Node`, `Edge`
-*   **Locations:** `model/` package.
-*   **Behavior:**
-    *   `Network`: Represents the entire graph of possible pairings.
-    *   `Node`: Represents a specific state in the schedule (e.g., "Pilot at Base A after Flight 123").
-    *   `Edge`: Represents a transition between nodes (e.g., "Fly Flight 456 from Base A to Base B").
-*   **Algorithmic Role:** The `OptModel` class uses these to construct a shortest-path problem (often solved using Label Correcting algorithms).
+### 3.1 Request/Response DTOs
+- **`SnapshotSolutionRequestInputDTO`** ([`.../SnapshotSolutionRequestInputDTO.java:L6-6`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/SnapshotSolutionRequestInputDTO.java#L6-6)):
+  - **Purpose:** Represents the payload received from the client to initiate a sequence generation run. Contains parameters like date range, base locations, and employee IDs.
+- **`SolverResponseDTO`** ([`.../SolverResponseDTO.java:L7-7`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/SolverResponseDTO.java#L7-7)):
+  - **Purpose:** The primary response object returned to the client upon completion. Contains the generated sequences, status, and summary metrics.
+- **`SolverResponseSummaryDTO`** ([`.../SolverResponseSummaryDTO.java:L10-10`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/SolverResponseSummaryDTO.java#L10-10)):
+  - **Purpose:** A lightweight summary containing counts of valid/invalid sequences, total cost, and execution time.
 
-#### `Sequence`, `Solution`, `PairingSolution`
-*   **Locations:** `model/` package.
-*   **Behavior:**
-    *   `Sequence`: A valid chain of flight legs assigned to a single crew member.
-    *   `Solution`: The aggregate result containing multiple `Sequence` objects that cover all required flights.
-    *   `PairingSolution`: A specific view of a sequence optimized for cost or fairness.
-*   **State Management:** These objects are mutable during the construction phase but become immutable once validated and returned.
+### 3.2 Domain-Specific DTOs
+- **`SequenceDTO`** ([`.../SequenceDTO.java:L11-11`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/SequenceDTO.java#L11-11)):
+  - **Purpose:** Represents a single generated pairing. Includes a list of `FlightLegDTO` objects and associated `EmployeeActivityDTO`.
+- **`FlightLegDTO`** ([`.../FlightLegDTO.java:L10-10`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/FlightLegDTO.java#L10-10)):
+  - **Purpose:** Describes a single flight segment (Origin, Destination, Departure Time, Arrival Time, Aircraft Type).
+- **`EmployeeActivityDTO`** ([`.../EmployeeActivityDTO.java:L13-13`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/EmployeeActivityDTO.java#L13-13)):
+  - **Purpose:** Aggregates activities for an employee within a sequence (e.g., Duty Periods, Rest Periods).
+- **`DateTimeDTO`** ([`.../DateTimeDTO.java:L13-13`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/DateTimeDTO.java#L13-13)):
+  - **Purpose:** Standardizes date/time representation across the module, often wrapping `java.time.LocalDateTime`.
 
-#### `UnsequencedLeg`, `UnsequencedLegPairing`
-*   **Locations:** `model/` package.
-*   **Behavior:** Represents raw flight data that has not yet been assigned to a sequence. The `ConstructNetwork` processor iterates over these to build the `Network` graph.
+### 3.3 Specialized DTOs
+- **`AccessTokenDTO`** ([`.../AccessTokenDTO.java:L8-8`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/AccessTokenDTO.java#L8-8)):
+  - **Purpose:** Holds the OAuth2 bearer token required for authenticating with downstream services (e.g., QLA, Azure).
+- **`PlaceHolderEvents`** ([`.../PlaceHolderEvents.java:L6-6`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/PlaceHolderEvents.java#L6-6)):
+  - **Purpose:** Used to represent non-flight events (e.g., training, leave) in the schedule.
+- **`CKAScheduleDTO`** / **`StudentScheduleDTO`** ([`.../CKAScheduleDTO.java:L9-9`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/CKAScheduleDTO.java#L9-9), [`.../StudentScheduleDTO.java:L7-7`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/StudentScheduleDTO.java#L7-7)):
+  - **Purpose:** Specific DTOs for Crew Training (CKA) and Student Pilot scheduling scenarios.
 
-#### `Cka`, `CkaCredits`, `CkaBlankPeriod`
-*   **Locations:** `model/` package.
-*   **Behavior:** Specific models for "Crew Key Assignment" (CKA) logic, handling credits earned, blank periods (gaps in work), and specific contractual entitlements.
-
----
-
-## 4. Business Logic & Rules Engine
-
-The module enforces strict regulatory compliance through a rule-based architecture.
-
-#### Contractual Rules (`contractualrules/`)
-*   **Classes:** `FARRedeyeRule`, `PilotDomesticSequenceRule`, `WOCL`, `ThreeAMHBT`, `BaseLayover`, `PilotRedeyeRule`.
-*   **Behavior:**
-    *   Each class implements a specific regulation check.
-    *   **Example (`WOCL`):** Checks for "Weekend Off Cycle Limit" violations.
-    *   **Example (`ThreeAMHBT`):** Validates minimum rest periods if a duty starts before 03:00 AM.
-*   **Execution:** These rules are invoked by the `LegalityInterpreter` during the validation phase. If a rule returns `false`, the sequence is marked illegal.
-
-#### Regulatory Rules (`rules/`)
-*   **Classes:** `FAR117FTRule`, `FAR121FDPRule`, `FAR117RestTimeRule`, `FAR121RestTimeRule`.
-*   **Behavior:**
-    *   **`FAR117FTRule`**: Validates flight time limits based on duty start time and crew size.
-        *   *Logic:* Calculates total flight time in a duty period and compares it against the maximum allowed hours defined in FAR 117.
-    *   **`FAR121FDPRule`**: Enforces Flight Duty Period (FDP) limits specific to Part 121 operations.
-*   **Error Handling:** Violations throw `SolverException` or return structured `RuleResult` objects indicating the specific violation code.
-
-#### `LegalityInterpreter` & `LegalityInterpreterRepository`
-*   **Locations:** `qlacheck/response/` package.
-*   **Behavior:**
-    *   Acts as the central orchestrator for legality checks.
-    *   Accepts a `PilotLegalityRequest` and iterates through all applicable rules.
-    *   Returns a `PilotLegalityResponse` containing a list of `RuleResult` objects.
-*   **Interface:** `LegalityInterpreterRepository` defines the contract for fetching rule configurations or historical data.
+### 3.4 Custom Serialization
+To ensure consistent date handling, the module implements custom Jackson serializers/deserializers:
+- **`LocalDateSerializer`** / **`LocalDateDeserializer`** ([`.../LocalDateSerializer.java:L13-13`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/LocalDateSerializer.java#L13-13), [`.../LocalDateDeserializer.java:L11-11`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/LocalDateDeserializer.java#L11-11)):
+  - **Behavior:** Converts `java.time.LocalDate` to/from ISO-8601 string format (`yyyy-MM-dd`).
+- **`LocalDateTimeSerializer`** / **`LocalDateTimeDeserializer`** ([`.../LocalDateTimeSerializer.java:L12-12`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/LocalDateTimeSerializer.java#L12-12), [`.../LocalDateTimeDeserializer.java:L12-12`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/dto/LocalDateTimeDeserializer.java#L12-12)):
+  - **Behavior:** Converts `java.time.LocalDateTime` to/from ISO-8601 string format (`yyyy-MM-dd'T'HH:mm:ss`).
 
 ---
 
-## 5. Services & Orchestration
+## 4. Repository Layer (Data Access)
 
-### 5.1 Core Services
-*   **`SolverService`**: [`src/main/java/com/aa/fso/service/SolverService.java:L31-31`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/service/SolverService.java#L31-31)
-    *   **Behavior:** The primary entry point for solving requests. Coordinates input validation, network construction, optimization execution, and output formatting.
-    *   **Flow:** `InputValidation` -> `ConstructNetwork` -> `Optimization` -> `LegalityCheck` -> `Output`.
+The repository layer abstracts data storage mechanisms, primarily focusing on Azure Blob Storage for large datasets and in-memory caching for performance.
 
-*   **`OptimizationService` / `OptimizationServiceImpl`**:
-    *   **Behavior:** Interfaces with the underlying mathematical solver (likely Xpress or similar).
-    *   **Implementation:** Wraps the solver API calls, handling timeouts and memory constraints.
+### 4.1 Azure Blob Storage
+**Interface:** `AzureBlobRepository` ([`.../AzureBlobRepository.java:L15-15`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/AzureBlobRepository.java#L15-15))
+**Implementation:** `AzureBlobRepositoryImpl` ([`.../AzureBlobRepositoryImpl.java:L25-25`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/AzureBlobRepositoryImpl.java#L25-25))
+- **Behavior:**
+  - Provides methods to upload JSON payloads to specific blob paths (e.g., `/input/{snapshotId}/data.json`).
+  - Handles downloading and parsing input data.
+  - Implements retry logic for transient network failures.
+  - Uses `AzureBlobStorageConfiguration` for connection management.
 
-*   **`PairingGenerationService` / `PairingGenerationServiceImpl`**:
-    *   **Behavior:** Handles the post-processing of the raw optimization output to generate human-readable pairings.
-    *   **Logic:** Aggregates `Sequence` objects, applies cost functions, and ensures coverage of all unsequenced legs.
+### 4.2 Input/Output Data Repositories
+**Interfaces:** `InputDataRespository` ([`.../InputDataRespository.java:L13-13`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/InputDataRespository.java#L13-13)), `OutputDataRepository` ([`.../OutputDataRepository.java:L6-6`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/OutputDataRepository.java#L6-6))
+**Implementations:** `InputDataRepositoryImpl` ([`.../InputDataRepositoryImpl.java:L55-55`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/InputDataRepositoryImpl.java#L55-55)), `OutputDataRepositoryImpl` ([`.../OutputDataRepositoryImpl.java:L16-16`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/OutputDataRepositoryImpl.java#L16-16))
+- **Behavior:**
+  - **Input:** Reads raw JSON from Blob Storage, deserializes into `ProcessedInputData`, and validates structure.
+  - **Output:** Serializes the final solution (`SolverResponseDTO`) and writes it back to Blob Storage.
+  - **LegData:** `LegDataRepository` / `LegDataRepositoryImpl` ([`.../LegDataRepository.java:L12-12`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/LegDataRepository.java#L12-12)) handles specific flight leg data caching.
 
-*   **`RunStateManager`**: [`src/main/java/com/aa/fso/service/RunStateManager.java:L20-20`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/service/RunStateManager.java#L20-20)
-    *   **Behavior:** Manages the lifecycle of a solver run.
-    *   **Key Feature:** Implements a **volatile kill flag**. When a `KillController` request is received, this flag is set. The `OptimizationService` checks this flag at periodic checkpoints to gracefully terminate the solver process.
-    *   **Singleton:** Ensures only one run executes per pod instance to prevent resource contention.
-
-### 5.2 Data Services
-*   **`InputDataService` / `OutputDataService`**: Handle the ingestion of raw CSV/JSON inputs and the persistence of results to Azure Blob Storage.
-*   **`ITDataService`**: Interfaces with external IT systems to fetch static data (e.g., airport codes, base locations).
-
----
-
-## 6. Infrastructure & Integration
-
-### 6.1 Repositories & Clients
-*   **`AzureBlobRepository` / `AzureBlobRepositoryImpl`**:
-    *   **Behavior:** Abstracts interactions with Azure Blob Storage.
-    *   **Methods:** `uploadFile`, `downloadFile`, `deleteFile`.
-    *   **Error Handling:** Wraps Azure SDK exceptions into `AzureBlobStorageException`.
-
-*   **`QLAClient` / `QLAClientImpl`**:
-    *   **Behavior:** REST client for communicating with the QLA (Quality Assurance/Logistics Application) external service.
-    *   **Retry Logic:** Implements exponential backoff for transient network failures.
-
-*   **`PingFederateTokenClient` / `AccessTokenClient`**:
-    *   **Behavior:** Handles OAuth2 authentication flows.
-    *   **Flow:** Exchanges client credentials for an access token, caches it, and refreshes it upon expiration.
-
-### 6.2 Messaging (Kafka)
-*   **`KafkaProducerService` / `KafkaConsumerService`**:
-    *   **Behavior:** Asynchronous communication layer.
-    *   **Producer:** Publishes job completion events or error notifications.
-    *   **Consumer:** Listens for external job triggers (e.g., "Start Solving Job ID 123").
-*   **`KafkaProducerListener`**: [`src/main/java/com/aa/fso/listener/KafkaProducerListener.java:L12-12`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/listener/KafkaProducerListener.java#L12-12)
-    *   **Behavior:** Intercepts successful message sends to trigger side effects (e.g., sending a Teams notification).
-
-### 6.3 Controllers
-*   **`HttpSolverController`**: [`src/main/java/com/aa/fso/controller/HttpSolverController.java:L31-31`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/controller/HttpSolverController.java#L31-31)
-    *   **Behavior:** Exposes REST endpoints (`POST /solve`, `GET /status`).
-    *   **Async Handling:** Returns a `202 Accepted` with a job ID immediately, allowing the client to poll for results.
-
-*   **`KillController`**: [`src/main/java/com/aa/fso/controller/KillController.java:L19-19`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/controller/KillController.java#L19-19)
-    *   **Behavior:** Endpoint to trigger the graceful shutdown of a running solver.
-    *   **Safety:** Validates that the requested job ID matches the currently active run in `RunStateManager`.
-
----
-
-## 7. Exception Handling Strategy
-
-The module employs a centralized exception handling mechanism to ensure consistent API responses.
-
-*   **`SolverException`**: [`src/main/java/com/aa/fso/exception/SolverException.java:L6-6`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/exception/SolverException.java#L6-6)
-    *   **Usage:** Thrown when the optimization algorithm fails to find a feasible solution or encounters a mathematical error.
-    *   **Handling:** Mapped to `500 Internal Server Error` with a detailed error message in the response body.
-
-*   **`InvalidUserInputException`**:
-    *   **Usage:** Thrown when input data violates schema or business logic constraints (e.g., invalid date range).
-    *   **Handling:** Mapped to `400 Bad Request`.
-
-*   **`KillRunException`**:
-    *   **Usage:** Thrown internally when the `KillRun` signal is detected.
-    *   **Handling:** Caught by the service layer to return a `200 OK` with a status message "Run Terminated by User".
-
-*   **`SolverExceptionHandler`**: [`src/main/java/com/aa/fso/exception/SolverExceptionHandler.java:L16-16`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/exception/SolverExceptionHandler.java#L16-16)
-    *   **Behavior:** Global `@ControllerAdvice` that catches all unchecked exceptions and converts them into standardized `MyErrorResponse` DTOs.
-
----
-
-## 8. Configuration & Security
-
-*   **`SecurityConfig`**: [`src/main/java/com/aa/fso/config/SecurityConfig.java:L16-16`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/config/SecurityConfig.java#L16-16)
-    *   **Behavior:** Configures Spring Security to require OAuth2 Bearer tokens for all endpoints.
-    *   **Integration:** Uses `ServicePrincipalAuthCallbackSB` to validate tokens issued by PingFederate.
-
-*   **`AppProperties`**: [`src/main/java/com/aa/fso/properties/AppProperties.java:L14-14`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/properties/AppProperties.java#L14-14)
-    *   **Behavior:** Loads environment-specific configuration (Azure connection strings, Kafka brokers, solver timeouts) from `application.properties` or environment variables.
-
----
-
-## 9. Summary of Workflow
-
-1.  **Ingestion:** Client sends `SnapshotSolutionRequestInputDTO` to `HttpSolverController`.
-2.  **Validation:** `InputValidationProcessor` checks data integrity.
-3.  **Preparation:** `InputDataService` loads static data; `ConstructNetwork` builds the graph (`Network`, `Node`, `Edge`).
-4.  **Optimization:**
+### 4.3 External Client Repositories
+These classes act as HTTP clients for external services.
+- **`PingFederateTokenClient`** / **`PingFederateTokenClientImpl`** ([`.../PingFederateTokenClient.java:L3-3`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/PingFederateTokenClient.java#L3-3), [`.../PingFederateTokenClientImpl.java:L21-21`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3d25/src/main/java/com/aa/fso/repository/PingFederateTokenClientImpl.java#L21-21)):
+  - **Behavior:** Authenticates with PingFederate using a Service Principal (Client ID/Secret) to obtain an access token. Implements token refresh logic.
+- **`AccessTokenClient`** / **`AccessTokenClientImpl`** ([`.../AccessTokenClient.java:L5-5`](file:///Users/venkatesansubramanian/AntiGravityProjects/Sequence_Builder-6e0c87bc6e817c8c6919be50c1f325a806eb3
 
 ---

@@ -1,49 +1,44 @@
-```markdown
 # RCA Context Prompt: Sequence Builder Incident Observer
 
 ## 1. System Blueprint & Tech Stack
-- **Core App**: `AAInternal/Sequence_Builder` (Spring Boot 3.x, Java SE).
-- **Architecture**: Event-driven, high-throughput. Async processing via **Apache Kafka** (Consumer/Producer).
-- **Entry Points**: 
-  - REST: `HttpSolverController.solveDebug` (POST), `KillController.getRunStatus`.
-  - Async: `KafkaConsumerService` (Topic: `${solver.topic.name}`).
-- **Domain Logic**: Flight sequence optimization (FAR 121 compliance). Graph construction (`ConstructNetwork`), Rule Engine (`FAR121RestTimeRule`, `PilotRedeyeRule`).
-- **Integrations**: 
-  - **DB**: `LegDataRepository` (JPA/Hibernate).
-  - **External**: PingFederate (Auth), FICO Xpress (Native C++ Optimizer), Azure Blob Storage.
-- **Runtime**: Embedded Tomcat, JVM Heap + Native Heap (JNI).
+*   **Core Runtime**: Java 17+, Spring Boot 3.x (Web MVC, Scheduling, DI).
+*   **Event Bus**: Apache Kafka (Ingestion: `KafkaConsumerService`, Outbound: `KafkaProducerService`).
+*   **Optimization Engine**: FICO Xpress (JNI/C++ native bindings) via `OptModel`.
+*   **Persistence**: Spring Data JPA (`LegDataRepository`, `OutputDataRepository`), Azure Blob Storage (`AzureBlobRepositoryImpl`).
+*   **External Integrations**: QLA REST Client, MS Teams Notifications, FOS HTTP Scripting.
+*   **Deployment**: Kubernetes (Containerized).
+*   **Key Classes**: `SequenceBuilderApplication`, `HttpSolverController`, `OptimizationService`, `ShortestPathComponent`.
 
 ## 2. Architectural Advantages & Safeguards
-- **Fault Tolerance**: `KillRunException` handling triggers `TeamsNotification` and state clearance.
-- **Decoupling**: Kafka separation of ingestion (`KafkaConsumerService`) and result publishing (`KafkaProducerService`).
-- **Modularity**: 196 classes, 710 methods; clear separation of Controller, Service, Repository, and Rule layers.
-- **Config Management**: YAML profiles (`application-itnonprod.yaml`, etc.) for environment-specific Kafka/Timeout tuning.
-- **Security**: Filter chain via `SecurityConfig` and `PingFederateTokenClientImpl`.
+*   **Decoupled Processing**: Kafka enables asynchronous scaling of solver tasks independent of the REST API.
+*   **Modular Rule Engine**: Regulatory logic (FAR 121, WOCL) is encapsulated in discrete classes (`FAR121RestTimeRule`, `WOCL`), facilitating isolated testing.
+*   **State Management**: `RunStateManager` provides explicit control over run lifecycles (snapshots, kill flags) for graceful shutdowns.
+*   **Observability**: Integrated MS Teams notifications trigger on critical failures (`KillRunException`).
+*   **Serialization**: Jackson handles robust JSON mapping for complex domain objects (`FlightDutyPeriod`, `ProjectedData`).
 
 ## 3. Architectural Limitations
-- **Native Memory Leaks**: `OptModel` lacks explicit `close()/dispose()` for FICO Xpress native instances (`XPRS`, `XPRB`).
-- **Resource Leaks**: 
-  - `HttpURLConnection` in `LegDataRepositoryImpl.connectToFOS` not guaranteed closed in all paths.
-  - `BlobClient` instantiated per-request in `AzureBlobRepositoryImpl.saveData` (no pooling).
-- **Concurrency Hazards**: Mutable state in validation rules (`PilotRedeyeRule`, `BaseLayover`) modifies shared `UnsequencedLegPairing` objects.
-- **GC Pressure**: Aggressive `DutyInfo::deepCopy` in tight loops (`identifyDhdFromBase`, `identifyDhdToBase`).
-- **Algorithmic Inefficiency**: `FSOUtil.daysBetween` uses O(N) linear scan instead of O(1) `ChronoUnit`.
-- **State Bloat**: Large in-memory maps (`labelsMap`, `dhdHM`) lack TTL or eviction policies.
+*   **Native Memory Leaks**: `OptModel` lacks explicit JNI cleanup (`finally` blocks) for FICO Xpress resources (`XPRSprob`, `XPRB`), causing native heap growth on failure/interruption.
+*   **Connection Pool Exhaustion**: `LegDataRepositoryImpl.connectToFOS` instantiates `HttpURLConnection` without guaranteed `disconnect()` in all exception paths.
+*   **GC Pressure Spikes**: `ShortestPathComponent` performs aggressive `deepCopy` of `DutyInfo` lists inside nested loops, generating massive object churn.
+*   **Mutable State Hazards**: Validation rules (`PilotRedeyeRule`) mutate shared input objects (`UnsequencedLegPairing`), risking race conditions in concurrent processing.
+*   **Algorithmic Inefficiency**: `FSOUtil.daysBetween` uses O(N) linear scanning instead of O(1) `ChronoUnit`.
+*   **Azure Client Overhead**: `AzureBlobRepositoryImpl` creates clients per method call; requires verification against pooling strategies for high throughput.
+*   **State TTL Absence**: In-memory `labelsMap` structures lack Time-To-Live (TTL) mechanisms, risking OOM in streaming/migration scenarios.
 
 ## 4. Failure Modes & Diagnostics (RCA Triage Cheatsheet)
 
-| Symptom | Probable Root Cause | Source File / Component | Diagnostic Action |
+| Symptom Category | Potential Root Cause | Primary File/Class | Diagnostic Evidence / Citation |
 | :--- | :--- | :--- | :--- |
-| **Native Heap OOM / Crash** | JNI/C++ Memory Leak: `OptModel` fails to dispose native Xpress instances. | `OptModel.java` (No `close()` in `finally`) | Check Native Heap metrics; Inspect `OptimizationServiceImpl` for missing cleanup. |
-| **Socket Exhaustion / 503** | `HttpURLConnection` leak in `connectToFOS` (missing `disconnect()`). | `LegDataRepositoryImpl.java` | Monitor open file descriptors; Check for `IOException` in logs during high load. |
-| **Azure Latency Spike** | Connection Pool Exhaustion: New `BlobClient` per upload in `saveData`. | `AzureBlobRepositoryImpl.java` | Check Azure connection count; Monitor `saveData` throughput vs. latency. |
-| **CPU Spikes / High GC** | Object Churn: `DutyInfo::deepCopy` inside nested loops. | `ShortestPathComponent.java` (`identifyDhd...`) | Analyze GC logs (Full GC frequency); Check CPU usage during `solveDebug`. |
-| **Data Corruption / Race** | Mutable State: Rules mutate shared `UnsequencedLegPairing` objects. | `PilotRedeyeRule.java`, `BaseLayover.java` | Check for inconsistent validation results in concurrent runs; Inspect `checkRedeyeDuty`. |
-| **Slow Date Calculations** | O(N) Algorithm: `FSOUtil.daysBetween` linear scan. | `FSOUtil.java` | Profile `daysBetween` calls; Compare against `ChronoUnit.DAYS.between`. |
-| **Memory Growth (Steady)** | Missing State TTL: Maps (`labelsMap`, `dhdHM`) grow indefinitely. | `SequenceProcessor.java` / Domain Models | Monitor heap growth over time; Check for unbounded map sizes. |
+| **Native Heap OOM / Crash** | JNI Memory Leak (FICO Xpress) | `OptModel.java` | Missing `finally` block; `runModel` does not call `model.close()` or `XPRSend`. |
+| **Socket Exhaustion / Connection Timeout** | HTTP Resource Leak | `LegDataRepositoryImpl.java` | `connectToFOS` lacks `conn.disconnect()` in `catch`/`finally`; `HttpURLConnection` leaked on exceptions. |
+| **CPU Spikes / High GC Frequency** | Object Churn / Deep Copy | `ShortestPathComponent.java` | `identifyDhdFromBase`/`identifyDhdToBase` loop creates new `UnsequencedLegPairing` + `deepCopy` of entire `DutyInfo` list. |
+| **Data Corruption / Incorrect Legality** | Mutable State Race Condition | `PilotRedeyeRule.java` | `checkRedeyeDuty` mutates `dutyPeriod.setRedeye(true)` on shared input objects; side effects in concurrent threads. |
+| **Latency Spikes (Simple Calc)** | Inefficient Date Logic | `FSOUtil.java` | `daysBetween` uses O(N) `while` loop instead of `ChronoUnit.DAYS.between`. |
+| **Slow Blob Writes / Connection Saturation** | Azure Client Instantiation | `AzureBlobRepositoryImpl.java` | `saveData` creates new `BlobClient` per call; verify if pooling is required for high throughput. |
+| **Memory Growth (Streaming Context)** | Missing State TTL | `ShortestPathComponent.java` | `labelsMap` grows indefinitely without TTL; risk if migrated to Flink/streaming. |
 
-**Immediate RCA Focus**:
-1.  **Verify Native Cleanup**: Does `OptModel` release Xpress resources?
-2.  **Check Connection Handling**: Are `HttpURLConnection` and `BlobClient` properly closed/reused?
-3.  **Validate Concurrency**: Are rules running on shared mutable state?
-```
+**Immediate Action Protocol**:
+1.  **Check Native Heap**: Monitor `native_memory_usage` metrics; correlate spikes with `OptModel` execution logs.
+2.  **Verify Thread Safety**: Inspect `PilotRedeyeRule` execution context; look for concurrent access to `UnsequencedLegPairing`.
+3.  **Audit Connections**: Check open socket counts; correlate with `LegDataRepositoryImpl` error logs.
+4.  **GC Analysis**: Review GC logs for "Full GC" frequency; correlate with `ShortestPathComponent` loop iterations.

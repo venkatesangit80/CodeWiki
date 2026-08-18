@@ -16,19 +16,19 @@ sequenceDiagram
 ### Execution Trace Narration: Debug Solver Endpoint
 
 **Overview**
-The execution begins at the entry point `HttpSolverController.solveDebug`, located in `src/main/java/com/aa/fso/controller/HttpSolverController.java`. This endpoint is designed to trigger the solver logic using manually provided `UserInput` data, mimicking the behavior of an event-driven solver invocation. The method is mapped to the POST path `/solveDebug` and is annotated with OpenAPI documentation to describe its purpose.
+The execution begins at the `HttpSolverController` entry point, specifically the `solveDebug` method located in `src/main/java/com/aa/fso/controller/HttpSolverController.java`. This endpoint is designed to facilitate manual testing of the solver logic by accepting a `UserInput` payload directly via an HTTP POST request to the `/solveDebug` route. The operation is documented to mirror the standard solver execution flow triggered by event hubs, ensuring consistency between manual and automated test scenarios.
 
 **Execution Path and Data Flow**
-Upon receiving a request, the controller extracts the `UserInput` object from the request body. The flow immediately enters a `try` block to handle the core business logic. Inside this block, the controller delegates the solving process to the `solverService` by invoking the `solve` method with the provided `userInput` argument. This service call returns a `SolverResponseDTO` object, which encapsulates the solver's results.
+Upon receiving the request, the controller extracts the `UserInput` object from the request body. The control flow immediately delegates the core computational logic to the `solverService` layer. Specifically, the `solve` method is invoked with the provided user input, returning a `SolverResponseDTO` object that encapsulates the solver's results.
 
-**Conditionals and Mutations**
-The code snippet provided does not contain explicit conditional logic (e.g., `if` statements) or complex branching within the visible scope. The primary mutation occurs during the service call, where the internal state of the solver is processed based on the input parameters. The result is then transformed into a list of `OutputData` objects via the `getSolutions()` method on the `SolverResponseDTO`.
+A commented-out line in the source code indicates an alternative execution path (`solveWithLocalJsonFile`) which allows the solver to operate against a local JSON file instead of the dynamic input; however, this path is currently inactive. The active path proceeds to extract the list of solutions from the `SolverResponseDTO` using the `getSolutions()` accessor method.
 
-A critical aspect of this execution is the `finally` block. Regardless of whether the `solve` operation succeeds or throws an exception, the `runStateManager.clearRun()` method is guaranteed to execute. This ensures that any transient runtime state associated with the current execution is cleaned up, preventing memory leaks or state contamination for subsequent requests.
+**State Management and Cleanup**
+Crucially, the method employs a `try-finally` block to ensure robust state management. Regardless of whether the solver execution succeeds or throws an exception, the `finally` block guarantees the execution of `runStateManager.clearRun()`. This step is vital for resetting the internal run state of the application, preventing stale data from persisting across subsequent requests or test cycles.
 
-**Final Return Output**
-If the execution completes without unhandled exceptions, the method returns a `ResponseEntity` with an HTTP status code of 200 (OK). The body of this response contains the list of solutions extracted from the `SolverResponseDTO`.
+**Return Output**
+If the execution completes without interruption, the controller constructs and returns a `ResponseEntity` with an HTTP 200 OK status. The body of this response contains the `List<OutputData>` retrieved from the solver response, representing the computed solutions for the provided input.
 
-**Code Reference**
-The specific implementation details for this flow are found in:
-[src/main/java/com/aa/fso/controller/HttpSolverController.java:34-46]
+**Source Reference**
+The implementation details described above correspond to the following code segment:
+[src/main/java/com/aa/fso/controller/HttpSolverController.java:10-25]
