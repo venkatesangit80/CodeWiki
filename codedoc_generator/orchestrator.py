@@ -32,6 +32,16 @@ class GeneratorOrchestrator:
         else:
             self.llm_client: BaseLLMClient = PythonFallbackClient(config)
 
+    def _clean_markdown(self, text: str) -> str:
+        text = text.strip()
+        if text.startswith("```markdown"):
+            text = text[len("```markdown"):].strip()
+        elif text.startswith("```"):
+            text = text[len("```"):].strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+        return text
+
     def _get_package_name(self, file_path: str) -> str:
         parts = os.path.dirname(file_path).split(os.sep)
         if "java" in parts:
@@ -376,9 +386,9 @@ class GeneratorOrchestrator:
             
         else:
             key_chunks = self.vector_store.retrieve(
-                "performance bottlenecks, nested loops, blocking locks, thread pool concurrency, native memory JNI C++ C allocation, resource release close dispose free leak, controller ingress egress endpoints, connection idle timeout, KafkaConfig, connections.max.idle.ms, liveness probe health check webapp.yaml, singleton state contamination, volatile kill flags, concurrent requests",
+                "performance bottlenecks, nested loops, blocking locks, thread pool concurrency, native memory JNI C++ C allocation, resource release close dispose free leak, controller ingress egress endpoints, connection idle timeout, KafkaConfig, connections.max.idle.ms, liveness probe health check webapp.yaml, singleton state contamination, volatile kill flags, concurrent requests, XPRB, XPRS, OptModel",
                 {"repo_id": self.config.repos[0].repo_id},
-                top_k=40
+                top_k=80
             )
             code_context_blocks = []
             for record, _ in key_chunks:
@@ -418,6 +428,7 @@ class GeneratorOrchestrator:
             )
             
             llm_narrative = await self.llm_client.generate_completion(system_prompt, user_content)
+            llm_narrative = self._clean_markdown(llm_narrative)
             
             # Post-process to fix any unquoted Mermaid node labels containing parentheses/special characters
             # e.g., L[OptModel (JNI)] -> L["OptModel (JNI)"]
@@ -504,9 +515,9 @@ class GeneratorOrchestrator:
             return doc
         else:
             sre_chunks = self.vector_store.retrieve(
-                "state descriptor enableTimeToLive stateTtlConfig, close connection dispose client, static collection cache thread local, deepCopy SpecificData cloneWrapper, linear scan nested loops synchronized lock, MongoClient, connections.max.idle.ms, liveness probe health check",
+                "state descriptor enableTimeToLive stateTtlConfig, close connection dispose client, static collection cache thread local, deepCopy SpecificData cloneWrapper, linear scan nested loops synchronized lock, MongoClient, connections.max.idle.ms, liveness probe health check, BlobClient connection leak AzureBlobRepositoryImpl, HttpURLConnection connectToFOS LegDataRepositoryImpl, PilotRedeyeRule UnsequencedLegPairing mutable redeye, OptModel JNI memory leak",
                 {"repo_id": self.config.repos[0].repo_id},
-                top_k=40
+                top_k=80
             )
             code_context_blocks = []
             for record, _ in sre_chunks:
@@ -518,10 +529,11 @@ class GeneratorOrchestrator:
                 "You are an expert SRE and JVM/Flink performance engineer. Perform a deep, thorough SRE & Performance Audit of the codebase.\n"
                 "Analyze the provided code and configuration snippets. Specifically search for and report on:\n"
                 "1. Flink State TTL leaks: Audit for Flink state descriptors (ValueStateDescriptor, MapStateDescriptor, etc.) initialized without calling enableTimeToLive() on them.\n"
-                "2. High memory allocation churn & GC pressure: Audit for expensive dynamic cloning (e.g. SpecificData.get().deepCopy), nested collection allocations, or excessive object creation inside map/flatmap/filter functions.\n"
-                "3. Concurrency hazards / Singleton state contamination: Audit for shared mutable instance variables in stateless operators, or static/thread-local cache leaks.\n"
-                "4. Unclosed resources: Check if MongoClient, database handles, HTTP clients, or native buffers are dynamically instantiated inside processing loops instead of open()/close() lifecycle methods.\n"
+                "2. High memory allocation churn & GC pressure: Audit for expensive dynamic cloning (e.g. SpecificData.get().deepCopy), nested collection allocations, or excessive object creation inside map/flatmap/filter functions (such as connectToFOS in LegDataRepositoryImpl).\n"
+                "3. Concurrency hazards / Singleton state contamination / Shared object mutation: Audit for shared mutable instance variables in stateless operators, or static/thread-local cache leaks. Also flag if validation rules (like PilotRedeyeRule) mutate the shared input domain objects (like UnsequencedLegPairing) directly in validation loops.\n"
+                "4. Connection & Resource leaks: Check if MongoClient, Azure Blob Client (BlobClient inside saveData loops in AzureBlobRepositoryImpl), HttpURLConnection, database handles, HTTP clients, or native buffers (OptModel JNI handles) are dynamically instantiated inside processing loops instead of reusing them or calling close/dispose in finally blocks.\n"
                 "5. Inefficient data structures: Check for O(N) linear scans on collections inside streaming operators.\n"
+                "6. Native JNI C++ Memory Leaks: Audit for native library wrappers (such as FICO Xpress BCL/Optimizer env or problem instances like XPRB or XPRS inside OptModel.java) initialized in objects but never freed or closed via finally blocks or explicit close() calls, causing native heap memory leaks.\n"
                 "Format the response in professional markdown with clear headings, file citations with line ranges in brackets (e.g., [FileName.java:L123-145]), and actionable recommendations."
             )
             
@@ -535,7 +547,7 @@ class GeneratorOrchestrator:
             )
             
             doc = await self.llm_client.generate_completion(system_prompt, user_content)
-            return doc
+            return self._clean_markdown(doc)
 
     async def generate_rca_context_prompt(self, sre_audit_doc: str, hldd_data: Dict[str, str]) -> str:
         """Generates a token-optimized, machine-triage-friendly SRE observer prompt for live RCA."""
@@ -563,11 +575,12 @@ class GeneratorOrchestrator:
                 "You are an SRE Architect designing context prompts for live autonomous incident observers.\n"
                 "Generate a highly structured, token-optimized, and machine-comprehensible 'RCA Context Prompt' markdown document.\n"
                 "This document will be used directly as a system context prompt for an AI agent performing real-time Root Cause Analysis (RCA) on the system.\n"
+                "Ensure you analyze the SRE Audit Findings and explicitly document native JNI memory leaks / C++ optimizer leaks in OptModel.java (lack of explicit env/model close), Azure Blob Client connection leaks in AzureBlobRepositoryImpl, and mutable state hazards in PilotRedeyeRule.\n"
                 "Structure the document exactly as follows:\n"
                 "1. **System Blueprint & Tech Stack**: Extremely concise summary of key frameworks, source systems, and sink systems.\n"
                 "2. **Architectural Advantages & Safeguards**: Strengths (e.g., fault-tolerance features, retry settings, logging filters).\n"
-                "3. **Architectural Limitations**: Hard boundaries (e.g., parallelism limits, message serialization overheads).\n"
-                "4. **Failure Modes & Diagnostics (RCA Triage Cheatsheet)**: Map known configuration/code vulnerabilities to potential incident symptoms (e.g., CPU Spikes -> [File.java], Checkpoint Failures -> State TTL issue). Keep descriptions concise and citation-focused."
+                "3. **Architectural Limitations**: Hard boundaries (e.g., parallelism limits, message serialization overheads, native memory leaks).\n"
+                "4. **Failure Modes & Diagnostics (RCA Triage Cheatsheet)**: Map known configuration/code vulnerabilities to potential incident symptoms (e.g., CPU Spikes -> [File.java], Checkpoint Failures -> State TTL issue, Native Heap Growth/OOM -> [OptModel.java] JNI memory leak). Keep descriptions concise and citation-focused."
             )
             
             user_content = (
@@ -577,7 +590,7 @@ class GeneratorOrchestrator:
             )
             
             doc = await self.llm_client.generate_completion(system_prompt, user_content)
-            return doc
+            return self._clean_markdown(doc)
 
     async def generate_lldd_module(self, module_name: str, symbols: List[Dict[str, Any]]) -> Dict[str, str]:
         """Runs LLDD generation for a module. Synchronously generates structure, but uses LLM for details if active."""
@@ -602,13 +615,15 @@ class GeneratorOrchestrator:
             end = s.get("end_line", 0)
             file_path = s.get("file_path", "")
             
-            details_lines.append(
-                f"#### {kind}: `{name}`\n"
-                f"- **Declared In:** [`{file_path}:L{start}-{end}`](file://{os.path.join(self.config.repos[0].local_path, file_path)}#L{start}-{end})\n"
-                f"- **Signature:** `{sig}`\n"
-                f"- **Documentation:**\n"
-                f"  > {doc}\n"
-            )
+            # Only document CLASS and INTERFACE in the text payload if the module has many symbols to prevent NATS timeouts/crashes
+            if len(symbols) < 60 or kind in ["CLASS", "INTERFACE"]:
+                details_lines.append(
+                    f"#### {kind}: `{name}`\n"
+                    f"- **Declared In:** [`{file_path}:L{start}-{end}`](file://{os.path.join(self.config.repos[0].local_path, file_path)}#L{start}-{end})\n"
+                    f"- **Signature:** `{sig}`\n"
+                    f"- **Documentation:**\n"
+                    f"  > {doc}\n"
+                )
             
             if kind in ["CLASS", "FUNCTION"]:
                 node_id = f"sym_{node_idx}"
@@ -646,7 +661,7 @@ class GeneratorOrchestrator:
                 "Explain the behavior of each class and method in professional English. Cite files exactly, e.g. [file.py:L10-25]."
             )
             enhanced = await self.llm_client.generate_completion(system_prompt, f"Enhance and document the following module components:\n{details_text}")
-            details_text = enhanced
+            details_text = self._clean_markdown(enhanced)
 
         return {
             "module_name": module_name,
@@ -733,6 +748,7 @@ class GeneratorOrchestrator:
                 "Code Call Sequence:\n" + "\n".join(code_context)
             )
             narrated_text = await self.llm_client.generate_completion(system_prompt, user_content)
+            narrated_text = self._clean_markdown(narrated_text)
             
             doc = (
                 f"# Feature Walkthrough: {entry_point['kind'].capitalize()} `{entry_point['name']}`\n\n"

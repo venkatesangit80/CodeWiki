@@ -1,55 +1,262 @@
 import os
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import shutil
+import uuid
+import re
+import subprocess
+import logging
+from pydantic import BaseModel
+
+from codedoc_generator.config import GeneratorConfig
+from codedoc_generator.storage import get_storage_provider
+
+logger = logging.getLogger("doc_viewer")
 
 app = FastAPI(title="Everops Wiki Document Viewer")
 
 WORKSPACE_DIR = Path(__file__).parent.resolve()
-REPO_DOCS_DIR = WORKSPACE_DIR / "repo_docs"
 
-# Serve the static files from repo_docs
-if REPO_DOCS_DIR.exists():
-    app.mount("/repo_docs", StaticFiles(directory=str(REPO_DOCS_DIR)), name="repo_docs")
+generation_jobs = {}
 
-def build_tree(path: Path, relative_to: Path) -> List[Dict[str, Any]]:
-    tree = []
+class LocalStorageSettings(BaseModel):
+    storage_type: str = "efs"
+    bucket_name: Optional[str] = None
+    region: Optional[str] = None
+    access_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    azure_container: Optional[str] = None
+    connection_string: Optional[str] = None
+    base_path: Optional[str] = None
+
+class LocalNatsSettings(BaseModel):
+    nats_url: Optional[str] = None
+    user: Optional[str] = None
+    password: Optional[str] = None
+
+class GenerateRequest(BaseModel):
+    github_url: str
+    tech: str = "generic"
+    ignore_paths: Optional[List[str]] = None
+    github_token: Optional[str] = None
+    mode: str = "vault"  # vault | local
+    local_storage: Optional[LocalStorageSettings] = None
+    local_nats: Optional[LocalNatsSettings] = None
+
+def run_background_generation(req: GenerateRequest, run_id: str):
+    import asyncio
+    new_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(new_loop)
+    
+    generation_jobs[run_id] = {"status": "running", "error": None}
+    temp_dir = os.path.abspath(f"./repos/run_{run_id}")
+    
+    # Store original Vault state to restore later
+    old_use_vault = os.environ.get("USE_VAULT")
+    
     try:
-        # Sort directories first, then files
-        for entry in sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
-            if entry.name.startswith(".") or entry.name == "System Volume Information":
-                continue
+        url = req.github_url.strip()
+        if not url.startswith("http") and "/" in url:
+            url = f"https://github.com/{url}"
+        if not url.endswith(".git"):
+            url = url + ".git"
             
-            rel_path = entry.relative_to(relative_to)
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        github_token = req.github_token or os.environ.get("GITHUB_PAT")
+        auth_url = url
+        if github_token:
+            auth_url = url.replace("https://", f"https://{github_token}@")
             
-            if entry.is_dir():
-                children = build_tree(entry, relative_to)
-                if children: # Only add directory if it has children or files
-                    tree.append({
-                        "name": entry.name,
-                        "type": "directory",
-                        "path": str(rel_path),
-                        "children": children
-                    })
+        logger.info(f"Cloning {url} into {temp_dir}...")
+        subprocess.run(["git", "clone", "--depth", "1", auth_url, temp_dir], check=True)
+        
+        match = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
+        repo_id = f"{match.group(1)}/{match.group(2)}" if match else f"cloned/repo_{run_id}"
+        
+        from codedoc_generator.config import GeneratorConfig, RepoConfig, LLMConfig, EmbeddingConfig, VectorStoreConfig, AnalysisConfig, OutputConfig, StorageConfig
+        
+        if req.mode == "local":
+            os.environ["USE_VAULT"] = "False"
+            
+            nats_settings = req.local_nats or LocalNatsSettings()
+            llm_endpoint = nats_settings.nats_url or "nats://localhost:4222"
+            nats_user = nats_settings.user or ""
+            nats_password = nats_settings.password or ""
+            
+            storage_settings = req.local_storage or LocalStorageSettings()
+            st_type = storage_settings.storage_type.lower()
+            if st_type == "s3":
+                conn_settings = {
+                    "bucket_name": storage_settings.bucket_name,
+                    "region": storage_settings.region or "us-west-2",
+                    "access_key": storage_settings.access_key,
+                    "secret_key": storage_settings.secret_key
+                }
+            elif st_type == "azure":
+                conn_settings = {
+                    "azure_container": storage_settings.azure_container,
+                    "connection_string": storage_settings.connection_string
+                }
             else:
-                if entry.suffix.lower() == ".md":
-                    tree.append({
-                        "name": entry.name,
-                        "type": "file",
-                        "path": str(rel_path)
-                    })
+                conn_settings = {
+                    "base_path": storage_settings.base_path or "."
+                }
+            storage_obj = StorageConfig(type=st_type, connection_settings=conn_settings)
+        else:
+            os.environ["USE_VAULT"] = "True"
+            llm_endpoint = os.environ.get("NATS_SERVER_URL", "nats://ec2-54-191-170-106.us-west-2.compute.amazonaws.com:4222")
+            nats_user = os.environ.get("NATS_USER", "js_everyops")
+            nats_password = os.environ.get("NATS_PASSWORD", "8BcUaUYxOnVG8g1T")
+            storage_obj = config.storage if (globals().get("config") and config.storage) else StorageConfig()
+
+        config_obj = GeneratorConfig(
+            repos=[
+                RepoConfig(
+                    repo_id=repo_id,
+                    branch="main",
+                    local_path=temp_dir,
+                    tech=req.tech
+                )
+            ],
+            llm=LLMConfig(
+                provider="nats",
+                endpoint=llm_endpoint,
+                nats_user=nats_user,
+                nats_password=nats_password,
+                temperature=0.2
+            ),
+            embedding=EmbeddingConfig(
+                provider="mock",
+                model="mock-nomic",
+                endpoint=""
+            ),
+            vector_store=VectorStoreConfig(
+                backend="sqlite",
+                path=":memory:"
+            ),
+            analysis=AnalysisConfig(
+                ignore_paths=req.ignore_paths or [".git", "node_modules", "dist", "build", "__pycache__", "venv", "target", ".mvn", "src/test"],
+                module_granularity="directory"
+            ),
+            output=OutputConfig(
+                formats=["markdown"],
+                output_dir=os.path.join("repo_docs", req.tech, repo_id.split("/")[-1])
+            ),
+            storage=storage_obj
+        )
+        
+        from codedoc_generator.cli import _run_generation
+        
+        _run_generation(config_obj, config_obj.repos[0], None)
+        generation_jobs[run_id] = {"status": "completed", "error": None}
+        logger.info(f"Background generation completed for run {run_id}")
+        
     except Exception as e:
+        logger.error(f"Background generation failed for run {run_id}: {e}")
+        generation_jobs[run_id] = {"status": "failed", "error": str(e)}
+    finally:
+        # Restore original Vault switch state
+        if old_use_vault is not None:
+            os.environ["USE_VAULT"] = old_use_vault
+        else:
+            os.environ.pop("USE_VAULT", None)
+            
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+# Load config if exists
+config_path = "sequence_builder_config.yaml"
+if not os.path.exists(config_path):
+    config_path = "codedoc_config.yaml"
+
+config = None
+if os.path.exists(config_path):
+    try:
+        config = GeneratorConfig.load_from_yaml(config_path)
+    except Exception:
         pass
-    return tree
+
+storage = get_storage_provider(config)
+
+def build_tree_from_paths(paths: List[str]) -> List[Dict[str, Any]]:
+    tree_root = {}
+    for path in paths:
+        path = path.replace("\\", "/")
+        if path.startswith("repo_docs/"):
+            rel_path = path[len("repo_docs/"):]
+        else:
+            rel_path = path
+            
+        parts = rel_path.split("/")
+        current = tree_root
+        for i, part in enumerate(parts):
+            if not part:
+                continue
+            is_file = (i == len(parts) - 1)
+            entry_path = "/".join(parts[:i+1])
+            if part not in current:
+                if is_file:
+                    if part.endswith(".md"):
+                        current[part] = {
+                            "name": part,
+                            "type": "file",
+                            "path": entry_path
+                        }
+                else:
+                    current[part] = {
+                        "name": part,
+                        "type": "directory",
+                        "path": entry_path,
+                        "children": {}
+                    }
+            if not is_file and part in current:
+                current = current[part]["children"]
+
+    def dict_to_list(d):
+        lst = []
+        for key, val in d.items():
+            if val["type"] == "directory":
+                val["children"] = dict_to_list(val["children"])
+            lst.append(val)
+        return sorted(lst, key=lambda e: (e["type"] != "directory", e["name"].lower()))
+
+    return dict_to_list(tree_root)
+
+@app.get("/repo_docs/{doc_path:path}")
+def get_document(doc_path: str):
+    full_path = os.path.join("repo_docs", doc_path)
+    content = storage.read_file(full_path)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return PlainTextResponse(content)
 
 @app.get("/api/tree")
 def get_tree():
-    if not REPO_DOCS_DIR.exists():
+    try:
+        paths = storage.list_files(prefix="repo_docs")
+        return build_tree_from_paths(paths)
+    except Exception as e:
         return []
-    return build_tree(REPO_DOCS_DIR, REPO_DOCS_DIR)
+
+@app.post("/api/generate")
+def trigger_generation(req: GenerateRequest, background_tasks: BackgroundTasks):
+    run_id = str(uuid.uuid4())[:8]
+    background_tasks.add_task(run_background_generation, req, run_id)
+    return {"status": "started", "run_id": run_id}
+
+@app.get("/api/generate/status/{run_id}")
+def get_generation_status(run_id: str):
+    job = generation_jobs.get(run_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 @app.get("/", response_class=HTMLResponse)
 def get_index():
@@ -76,6 +283,9 @@ def get_index():
     <!-- Highlight.js for Code Highlighting -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    
+    <!-- html2pdf for PDF Generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
     
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
@@ -150,6 +360,28 @@ def get_index():
             border-right: none;
         }
 
+        .sidebar.resizing {
+            transition: none !important;
+        }
+
+        .resize-handle {
+            width: 4px;
+            cursor: col-resize;
+            background: transparent;
+            z-index: 20;
+            transition: all 0.2s;
+            height: 100%;
+            flex-shrink: 0;
+            margin-left: -2px;
+            margin-right: -2px;
+        }
+
+        .resize-handle:hover,
+        .resize-handle.active {
+            background: var(--primary);
+            box-shadow: 0 0 8px var(--primary);
+        }
+
         .sidebar-header {
             padding: 1.5rem;
             border-bottom: 1px solid var(--border-color);
@@ -164,6 +396,131 @@ def get_index():
             background: linear-gradient(to right, #3b82f6, #8b5cf6);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
+        }
+
+        /* Modal styling */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+
+        .modal-content {
+            background: #111827;
+            border: 1px solid #374151;
+            border-radius: 12px;
+            width: 480px;
+            max-width: 90%;
+            padding: 2rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+
+        .modal-header h2 {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #f3f4f6;
+            margin: 0;
+        }
+
+        .modal-close-btn {
+            background: none;
+            border: none;
+            color: #9ca3af;
+            cursor: pointer;
+        }
+
+        .form-group {
+            margin-bottom: 1.25rem;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: #9ca3af;
+            margin-bottom: 0.5rem;
+        }
+
+        .form-input, .form-select, .form-textarea {
+            width: 100%;
+            background: #1f2937;
+            border: 1px solid #374151;
+            border-radius: 6px;
+            color: #f3f4f6;
+            padding: 0.625rem;
+            font-size: 0.875rem;
+            outline: none;
+            box-sizing: border-box;
+        }
+
+        .form-input:focus, .form-select:focus, .form-textarea:focus {
+            border-color: #3b82f6;
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.75rem;
+            margin-top: 1.5rem;
+        }
+
+        .btn {
+            padding: 0.625rem 1.25rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+        }
+
+        .btn-secondary {
+            background: #374151;
+            color: #f3f4f6;
+        }
+
+        .btn-primary {
+            background: #2563eb;
+            color: #ffffff;
+        }
+
+        .btn-primary:hover {
+            background: #1d4ed8;
+        }
+
+        .btn-primary:disabled {
+            background: #4b5563;
+            cursor: not-allowed;
+        }
+        
+        .generate-btn {
+            background: none;
+            border: none;
+            color: #60a5fa;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.25rem;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        
+        .generate-btn:hover {
+            background: #1e293b;
         }
 
         .search-container {
@@ -476,6 +833,129 @@ def get_index():
             background-color: var(--border-color);
             margin: 3rem 0;
         }
+
+        /* PDF Export Styles (Clean Print Theme) */
+        body.pdf-exporting .markdown-wrapper {
+            background: #ffffff !important;
+            color: #1f2937 !important;
+            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+            padding: 24px !important;
+        }
+        body.pdf-exporting .markdown-body h1,
+        body.pdf-exporting .markdown-body h2,
+        body.pdf-exporting .markdown-body h3,
+        body.pdf-exporting .markdown-body strong {
+            color: #0f172a !important;
+        }
+        body.pdf-exporting .markdown-body h1 {
+            color: #1e3a8a !important; /* Professional Dark Navy for primary headings */
+            border-bottom: 2px solid #cbd5e1 !important;
+            padding-bottom: 8px !important;
+            margin-top: 0 !important;
+            page-break-after: avoid !important;
+            break-after: avoid !important;
+        }
+        body.pdf-exporting .markdown-body h2 {
+            color: #1e40af !important;
+            border-bottom: 1px solid #e2e8f0 !important;
+            padding-bottom: 6px !important;
+            margin-top: 2rem !important;
+            page-break-after: avoid !important;
+            break-after: avoid !important;
+        }
+        body.pdf-exporting .markdown-body h3 {
+            color: #2563eb !important;
+            margin-top: 1.5rem !important;
+            page-break-after: avoid !important;
+            break-after: avoid !important;
+        }
+        body.pdf-exporting .markdown-body p,
+        body.pdf-exporting .markdown-body li {
+            color: #334155 !important;
+            font-size: 0.95rem !important;
+            line-height: 1.6 !important;
+        }
+        body.pdf-exporting .markdown-body pre {
+            background-color: #f8fafc !important;
+            border: 1px solid #cbd5e1 !important;
+            border-radius: 6px !important;
+            padding: 12px 16px !important;
+            margin: 1.25rem 0 !important;
+            font-size: 0.85rem !important;
+            line-height: 1.5 !important;
+            overflow: hidden !important;
+            white-space: pre-wrap !important;
+            word-break: break-all !important;
+            page-break-inside: avoid !important;
+            break-inside: avoid !important;
+        }
+        body.pdf-exporting .markdown-body code {
+            font-family: 'JetBrains Mono', monospace !important;
+            background: #f1f5f9 !important;
+            color: #0f172a !important;
+            padding: 2px 4px !important;
+            border-radius: 4px !important;
+            font-size: 0.85rem !important;
+        }
+        body.pdf-exporting .markdown-body pre code {
+            background: none !important;
+            color: #0f172a !important;
+            padding: 0 !important;
+            font-size: 0.85rem !important;
+        }
+        body.pdf-exporting .markdown-body blockquote {
+            border-left: 4px solid #1e3a8a !important;
+            color: #475569 !important;
+            background: #f8fafc !important;
+            padding: 12px 16px !important;
+            margin: 1.25rem 0 !important;
+            border-radius: 4px !important;
+            page-break-inside: avoid !important;
+            break-inside: avoid !important;
+        }
+        body.pdf-exporting .markdown-body table {
+            border: 1px solid #cbd5e1 !important;
+            background: #ffffff !important;
+            width: 100% !important;
+            border-collapse: collapse !important;
+            margin: 1.5rem 0 !important;
+            page-break-inside: avoid !important;
+            break-inside: avoid !important;
+        }
+        body.pdf-exporting .markdown-body th {
+            border: 1px solid #cbd5e1 !important;
+            background: #f1f5f9 !important;
+            color: #0f172a !important;
+            font-weight: 600 !important;
+            padding: 8px 12px !important;
+        }
+        body.pdf-exporting .markdown-body td {
+            border: 1px solid #cbd5e1 !important;
+            color: #334155 !important;
+            padding: 8px 12px !important;
+        }
+        body.pdf-exporting .markdown-body svg {
+            background-color: #090d16 !important;
+            border-radius: 8px !important;
+            padding: 12px !important;
+            border: 1px solid #cbd5e1 !important;
+            max-width: 100% !important;
+        }
+
+        /* Print only header/footer */
+        .pdf-only-header,
+        .pdf-only-footer {
+            display: none !important;
+        }
+
+        body.pdf-exporting .pdf-only-header {
+            display: block !important;
+        }
+        body.pdf-exporting .pdf-only-footer {
+            display: block !important;
+            page-break-after: avoid !important;
+            break-after: avoid !important;
+        }
     </style>
 </head>
 <body>
@@ -545,6 +1025,13 @@ def get_index():
                         <line x1="18" y1="12" x2="22" y2="12"></line>
                         <line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line>
                         <line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line>
+                    </svg>
+                ),
+                "download": (
+                    <svg viewBox="0 0 24 24" width={size} height={size} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
                     </svg>
                 )
             };
@@ -618,16 +1105,145 @@ def get_index():
             );
         };
 
-        const App = () => {
-            const [tree, setTree] = useState([]);
-            const [searchTerm, setSearchTerm] = useState("");
-            const [selectedPath, setSelectedPath] = useState("");
-            const [docContent, setDocContent] = useState("");
-            const [loading, setLoading] = useState(false);
-            const [tech, setTech] = useState("");
-            const [comp, setComp] = useState("");
-            const [date, setDate] = useState("");
-            const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+            const App = () => {
+                const [tree, setTree] = useState([]);
+                const [searchTerm, setSearchTerm] = useState("");
+                const [selectedPath, setSelectedPath] = useState("");
+                const [docContent, setDocContent] = useState("");
+                const [loading, setLoading] = useState(false);
+                const [tech, setTech] = useState("");
+                const [comp, setComp] = useState("");
+                const [date, setDate] = useState("");
+                const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+                const [sidebarWidth, setSidebarWidth] = useState(320);
+                const [isResizing, setIsResizing] = useState(false);
+
+                const [isModalOpen, setIsModalOpen] = useState(false);
+                const [githubUrl, setGithubUrl] = useState("");
+                const [techSelect, setTechSelect] = useState("generic");
+                const [ignorePathsInput, setIgnorePathsInput] = useState(".git, node_modules, dist, build, __pycache__, venv, target, .mvn, src/test");
+                const [jobStatus, setJobStatus] = useState("idle");
+                const [jobError, setJobError] = useState("");
+
+                // Local and Vault Tab configuration states
+                const [activeTab, setActiveTab] = useState("vault"); // vault | local
+                const [githubToken, setGithubToken] = useState("");
+                const [localNatsUrl, setLocalNatsUrl] = useState("nats://localhost:4222");
+                const [localNatsUser, setLocalNatsUser] = useState("");
+                const [localNatsPass, setLocalNatsPass] = useState("");
+                const [localStorageType, setLocalStorageType] = useState("efs");
+                const [localS3Bucket, setLocalS3Bucket] = useState("");
+                const [localS3Region, setLocalS3Region] = useState("us-west-2");
+                const [localS3AccessKey, setLocalS3AccessKey] = useState("");
+                const [localS3SecretKey, setLocalS3SecretKey] = useState("");
+                const [localAzureContainer, setLocalAzureContainer] = useState("");
+                const [localAzureConnStr, setLocalAzureConnStr] = useState("");
+                const [localEfsBasePath, setLocalEfsBasePath] = useState(".");
+
+                const startResizing = (e) => {
+                    e.preventDefault();
+                    setIsResizing(true);
+                    
+                    const handleMouseMove = (moveEvent) => {
+                        const newWidth = Math.max(200, Math.min(600, moveEvent.clientX));
+                        setSidebarWidth(newWidth);
+                    };
+                    
+                    const handleMouseUp = () => {
+                        setIsResizing(false);
+                        window.removeEventListener("mousemove", handleMouseMove);
+                        window.removeEventListener("mouseup", handleMouseUp);
+                    };
+                    
+                    window.addEventListener("mousemove", handleMouseMove);
+                    window.addEventListener("mouseup", handleMouseUp);
+                };
+
+                const handleStartGeneration = () => {
+                    setJobStatus("running");
+                    setJobError("");
+                    
+                    let payload = {
+                        github_url: githubUrl,
+                        tech: techSelect,
+                        ignore_paths: ignorePathsInput.split(",").map(p => p.trim()).filter(Boolean),
+                        mode: activeTab
+                    };
+
+                    if (activeTab === "local") {
+                        payload.github_token = githubToken || null;
+                        payload.local_nats = {
+                            nats_url: localNatsUrl || null,
+                            user: localNatsUser || null,
+                            password: localNatsPass || null
+                        };
+                        payload.local_storage = {
+                            storage_type: localStorageType,
+                            bucket_name: localS3Bucket || null,
+                            region: localS3Region || null,
+                            access_key: localS3AccessKey || null,
+                            secret_key: localS3SecretKey || null,
+                            azure_container: localAzureContainer || null,
+                            connection_string: localAzureConnStr || null,
+                            base_path: localEfsBasePath || null
+                        };
+                    }
+                    
+                    fetch("/api/generate", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload)
+                    })
+                    .then(res => {
+                        if (!res.ok) throw new Error("Failed to contact generation service");
+                        return res.json();
+                    })
+                    .then(data => {
+                        if (data.status === "started") {
+                            pollJobStatus(data.run_id);
+                        } else {
+                            throw new Error("Failed to start background generation");
+                        }
+                    })
+                    .catch(err => {
+                        setJobStatus("failed");
+                        setJobError(err.message || "Request failed");
+                    });
+                };
+                
+                const pollJobStatus = (runId) => {
+                    const interval = setInterval(() => {
+                        fetch(`/api/generate/status/${runId}`)
+                            .then(res => {
+                                if (!res.ok) throw new Error("Job not found");
+                                return res.json();
+                            })
+                            .then(data => {
+                                if (data.status === "completed") {
+                                    clearInterval(interval);
+                                    setJobStatus("completed");
+                                    setIsModalOpen(false);
+                                    // Reset inputs
+                                    setGithubUrl("");
+                                    // Refresh doc tree
+                                    fetch("/api/tree")
+                                        .then(res => res.json())
+                                        .then(treeData => {
+                                            setTree(treeData);
+                                        });
+                                } else if (data.status === "failed") {
+                                    clearInterval(interval);
+                                    setJobStatus("failed");
+                                    setJobError(data.error || "Generation task failed");
+                                }
+                            })
+                            .catch(err => {
+                                clearInterval(interval);
+                                setJobStatus("failed");
+                                setJobError("Status polling failed: " + err.message);
+                            });
+                    }, 2000);
+                };
 
             useEffect(() => {
                 fetch("/api/tree")
@@ -699,6 +1315,30 @@ def get_index():
                     });
             };
 
+            const handleDownloadPDF = () => {
+                const element = document.querySelector('.markdown-wrapper');
+                if (!element) return;
+                
+                document.body.classList.add('pdf-exporting');
+                const filename = `${selectedPath.split("/").pop().replace(".md", "")}.pdf`;
+                
+                const opt = {
+                    margin:       20,
+                    filename:     filename,
+                    image:        { type: 'jpeg', quality: 0.98 },
+                    html2canvas:  { scale: 2, useCORS: true, logging: false },
+                    jsPDF:        { unit: 'mm', format: 'a4', orientation: 'portrait' },
+                    pagebreak:    { mode: ['avoid-all', 'css', 'legacy'] }
+                };
+                
+                html2pdf().set(opt).from(element).save().then(() => {
+                    document.body.classList.remove('pdf-exporting');
+                }).catch(err => {
+                    console.error("PDF generation failed:", err);
+                    document.body.classList.remove('pdf-exporting');
+                });
+            };
+
             useEffect(() => {
                 if (window.mermaid && !loading && docContent) {
                     try {
@@ -745,10 +1385,18 @@ def get_index():
             return (
                 <div className="app-container">
                     {/* Left Sidebar */}
-                    <div className={`sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`}>
+                    <div className={`sidebar ${isSidebarCollapsed ? 'collapsed' : ''} ${isResizing ? 'resizing' : ''}`} style={{ width: isSidebarCollapsed ? '0px' : `${sidebarWidth}px` }}>
                         <div className="sidebar-header">
                             <Icon name="book-open" size={22} className="text-blue-500" />
-                            <h1 style={{ marginRight: '0.5rem' }}>Everops Wiki Explorer</h1>
+                            <h1 style={{ marginRight: '0.5rem' }}>Everops Wiki</h1>
+                            <button 
+                                className="generate-btn"
+                                onClick={() => setIsModalOpen(true)}
+                                title="Build/Generate New Wiki"
+                                style={{ marginLeft: '0.5rem' }}
+                            >
+                                <Icon name="plus-circle" size={20} />
+                            </button>
                             <button 
                                 onClick={() => setIsSidebarCollapsed(true)} 
                                 style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', marginLeft: 'auto', display: 'flex', alignItems: 'center' }}
@@ -788,6 +1436,14 @@ def get_index():
                         </div>
                     </div>
 
+                    {/* Resize Handle */}
+                    {!isSidebarCollapsed && (
+                        <div 
+                            className={`resize-handle ${isResizing ? 'active' : ''}`}
+                            onMouseDown={startResizing}
+                        />
+                    )}
+
                     {/* Right Content Area */}
                     <div className="content-area">
                         {selectedPath ? (
@@ -809,6 +1465,16 @@ def get_index():
                                         </span>
                                     </div>
                                     <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                                        {/* 
+                                        <button 
+                                            onClick={handleDownloadPDF} 
+                                            className="tech-badge"
+                                            style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer', background: 'rgba(59, 130, 246, 0.15)', border: '1px solid rgba(59, 130, 246, 0.35)', color: '#60a5fa', transition: 'all 0.2s' }}
+                                            title="Download print-friendly PDF"
+                                        >
+                                            <Icon name="download" size={13} /> PDF
+                                        </button>
+                                        */}
                                         <span className="tech-badge">{tech}</span>
                                         <span className="date-badge">{comp}</span>
                                         {date && <span className="date-badge">{date}</span>}
@@ -822,10 +1488,25 @@ def get_index():
                                             <p>Rendering documentation...</p>
                                         </div>
                                     ) : (
-                                        <div 
-                                            className="markdown-wrapper markdown-body"
-                                            dangerouslySetInnerHTML={{ __html: docContent }}
-                                        />
+                                        <div className="markdown-wrapper markdown-body">
+                                            {/* Print-only Header */}
+                                            <div className="pdf-only-header">
+                                                <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '2px solid #2563eb', paddingBottom: '6px', marginBottom: '24px', fontSize: '10px', color: '#64748b', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' }}>
+                                                    <span>Everops Code Wiki Explorer</span>
+                                                    <span>{tech} / {comp}</span>
+                                                </div>
+                                            </div>
+                                            
+                                            <div dangerouslySetInnerHTML={{ __html: docContent }} />
+                                            
+                                            {/* Print-only Footer */}
+                                            <div className="pdf-only-footer">
+                                                <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: '10px', marginTop: '40px', display: 'flex', justifyContent: 'space-between', fontSize: '9px', color: '#64748b', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' }}>
+                                                    <span>Confidential & Proprietary</span>
+                                                    <span>Generated on {new Date().toLocaleDateString()}</span>
+                                                </div>
+                                            </div>
+                                        </div>
                                     )}
                                 </div>
                             </>
@@ -846,6 +1527,253 @@ def get_index():
                             </div>
                         )}
                     </div>
+
+                    {isModalOpen && (
+                        <div className="modal-overlay">
+                            <div className="modal-content" style={{ width: '560px', maxWidth: '95%' }}>
+                                <div className="modal-header">
+                                    <h2>Build & Generate Wiki</h2>
+                                    <button className="modal-close-btn" onClick={() => setIsModalOpen(false)}>
+                                        <Icon name="x" size={20} />
+                                    </button>
+                                </div>
+                                
+                                {jobStatus === "running" ? (
+                                    <div style={{ textAlign: 'center', padding: '2rem 0' }}>
+                                        <Icon name="loader" size={40} className="animate-spin text-blue-500" style={{ margin: '0 auto 1rem auto' }} />
+                                        <p style={{ fontWeight: 500, color: '#f3f4f6' }}>Building documentation wiki...</p>
+                                        <p style={{ fontSize: '0.875rem', color: '#9ca3af', marginTop: '0.5rem' }}>
+                                            Cloning repository, running structural parsing, generating architectural synthesis, and uploading docs to cloud storage.
+                                        </p>
+                                    </div>
+                                ) : (
+                                    <>
+                                        {/* Mode Switcher Tabs */}
+                                        <div style={{ display: 'flex', gap: '1rem', borderBottom: '1px solid #374151', marginBottom: '1.25rem', paddingBottom: '0.5rem' }}>
+                                            <button 
+                                                style={{ background: 'none', border: 'none', borderBottom: activeTab === 'vault' ? '2px solid #3b82f6' : 'none', color: activeTab === 'vault' ? '#3b82f6' : '#9ca3af', cursor: 'pointer', paddingBottom: '0.25rem', fontWeight: 600, fontSize: '0.9rem' }}
+                                                onClick={() => setActiveTab('vault')}
+                                            >
+                                                Vault (Enterprise)
+                                            </button>
+                                            <button 
+                                                style={{ background: 'none', border: 'none', borderBottom: activeTab === 'local' ? '2px solid #3b82f6' : 'none', color: activeTab === 'local' ? '#3b82f6' : '#9ca3af', cursor: 'pointer', paddingBottom: '0.25rem', fontWeight: 600, fontSize: '0.9rem' }}
+                                                onClick={() => setActiveTab('local')}
+                                            >
+                                                Local (Manual Dev)
+                                            </button>
+                                        </div>
+
+                                        <div style={{ maxHeight: '55vh', overflowY: 'auto', paddingRight: '0.5rem' }}>
+                                            <div className="form-group">
+                                                <label className="form-label">GitHub Repository URL / Path</label>
+                                                <input 
+                                                    type="text" 
+                                                    className="form-input" 
+                                                    placeholder="e.g. AAInternal/Sequence_Builder or HTTPS URL"
+                                                    value={githubUrl}
+                                                    onChange={e => setGithubUrl(e.target.value)}
+                                                />
+                                            </div>
+                                            
+                                            <div className="form-group">
+                                                <label className="form-label">Technology Category</label>
+                                                <select 
+                                                    className="form-select"
+                                                    value={techSelect}
+                                                    onChange={e => setTechSelect(e.target.value)}
+                                                >
+                                                    <option value="generic">generic</option>
+                                                    <option value="solver">solver</option>
+                                                    <option value="flink">flink</option>
+                                                    <option value="api">api</option>
+                                                </select>
+                                            </div>
+                                            
+                                            <div className="form-group">
+                                                <label className="form-label">Ignore Paths (Comma-separated)</label>
+                                                <textarea 
+                                                    className="form-textarea" 
+                                                    rows="2"
+                                                    value={ignorePathsInput}
+                                                    onChange={e => setIgnorePathsInput(e.target.value)}
+                                                />
+                                            </div>
+
+                                            {activeTab === "vault" ? (
+                                                <div style={{ background: '#1e293b', borderLeft: '4px solid #3b82f6', padding: '0.75rem 1rem', borderRadius: '4px', fontSize: '0.85rem', color: '#9ca3af', marginBottom: '1rem' }}>
+                                                    🔒 All connection parameters, credentials, NATS endpoints, and storage targets will be dynamically resolved from the Open Bao (Vault) agent configuration context.
+                                                </div>
+                                            ) : (
+                                                <div style={{ borderTop: '1px dashed #374151', paddingTop: '1rem', marginTop: '1rem' }}>
+                                                    <h3 style={{ fontSize: '0.95rem', color: '#f3f4f6', marginBottom: '1rem', fontWeight: 600 }}>Local Developer Credentials overrides</h3>
+                                                    
+                                                    <div className="form-group">
+                                                        <label className="form-label">GitHub PAT Override (Optional)</label>
+                                                        <input 
+                                                            type="password" 
+                                                            className="form-input" 
+                                                            placeholder="Personal Access Token for cloning private repos"
+                                                            value={githubToken}
+                                                            onChange={e => setGithubToken(e.target.value)}
+                                                        />
+                                                    </div>
+
+                                                    <h4 style={{ fontSize: '0.85rem', color: '#3b82f6', margin: '1rem 0 0.5rem 0', fontWeight: 600 }}>NATS completions settings</h4>
+                                                    <div className="form-group">
+                                                        <label className="form-label">NATS Server URL</label>
+                                                        <input 
+                                                            type="text" 
+                                                            className="form-input" 
+                                                            placeholder="nats://localhost:4222"
+                                                            value={localNatsUrl}
+                                                            onChange={e => setLocalNatsUrl(e.target.value)}
+                                                        />
+                                                    </div>
+                                                    <div style={{ display: 'flex', gap: '0.75rem' }}>
+                                                        <div className="form-group" style={{ flex: 1 }}>
+                                                            <label className="form-label">NATS Username</label>
+                                                            <input 
+                                                                type="text" 
+                                                                className="form-input" 
+                                                                value={localNatsUser}
+                                                                onChange={e => setLocalNatsUser(e.target.value)}
+                                                            />
+                                                        </div>
+                                                        <div className="form-group" style={{ flex: 1 }}>
+                                                            <label className="form-label">NATS Password</label>
+                                                            <input 
+                                                                type="password" 
+                                                                className="form-input" 
+                                                                value={localNatsPass}
+                                                                onChange={e => setLocalNatsPass(e.target.value)}
+                                                            />
+                                                        </div>
+                                                    </div>
+
+                                                    <h4 style={{ fontSize: '0.85rem', color: '#3b82f6', margin: '1rem 0 0.5rem 0', fontWeight: 600 }}>Local target storage Settings</h4>
+                                                    <div className="form-group">
+                                                        <label className="form-label">Storage Backend Type</label>
+                                                        <select 
+                                                            className="form-select"
+                                                            value={localStorageType}
+                                                            onChange={e => setLocalStorageType(e.target.value)}
+                                                        >
+                                                            <option value="efs">Local filesystem / EFS</option>
+                                                            <option value="s3">AWS S3 Bucket</option>
+                                                            <option value="azure">Azure Blob Storage</option>
+                                                        </select>
+                                                    </div>
+
+                                                    {localStorageType === "s3" && (
+                                                        <>
+                                                            <div className="form-group">
+                                                                <label className="form-label">S3 Bucket Name</label>
+                                                                <input 
+                                                                    type="text" 
+                                                                    className="form-input" 
+                                                                    placeholder="e.g. codewiki-bucket"
+                                                                    value={localS3Bucket}
+                                                                    onChange={e => setLocalS3Bucket(e.target.value)}
+                                                                />
+                                                            </div>
+                                                            <div className="form-group">
+                                                                <label className="form-label">S3 Region</label>
+                                                                <input 
+                                                                    type="text" 
+                                                                    className="form-input" 
+                                                                    placeholder="e.g. us-west-2"
+                                                                    value={localS3Region}
+                                                                    onChange={e => setLocalS3Region(e.target.value)}
+                                                                />
+                                                            </div>
+                                                            <div style={{ display: 'flex', gap: '0.75rem' }}>
+                                                                <div className="form-group" style={{ flex: 1 }}>
+                                                                    <label className="form-label">AWS Access Key ID</label>
+                                                                    <input 
+                                                                        type="text" 
+                                                                        className="form-input" 
+                                                                        value={localS3AccessKey}
+                                                                        onChange={e => setLocalS3AccessKey(e.target.value)}
+                                                                    />
+                                                                </div>
+                                                                <div className="form-group" style={{ flex: 1 }}>
+                                                                    <label className="form-label">AWS Secret Access Key</label>
+                                                                    <input 
+                                                                        type="password" 
+                                                                        className="form-input" 
+                                                                        value={localS3SecretKey}
+                                                                        onChange={e => setLocalS3SecretKey(e.target.value)}
+                                                                    />
+                                                                </div>
+                                                            </div>
+                                                        </>
+                                                    )}
+
+                                                    {localStorageType === "azure" && (
+                                                        <>
+                                                            <div className="form-group">
+                                                                <label className="form-label">Azure Container Name</label>
+                                                                <input 
+                                                                    type="text" 
+                                                                    className="form-input" 
+                                                                    placeholder="e.g. wikicontainer"
+                                                                    value={localAzureContainer}
+                                                                    onChange={e => setLocalAzureContainer(e.target.value)}
+                                                                />
+                                                            </div>
+                                                            <div className="form-group">
+                                                                <label className="form-label">Azure Storage Connection String</label>
+                                                                <textarea 
+                                                                    className="form-textarea" 
+                                                                    rows="2"
+                                                                    placeholder="DefaultEndpointsProtocol=https;..."
+                                                                    value={localAzureConnStr}
+                                                                    onChange={e => setLocalAzureConnStr(e.target.value)}
+                                                                />
+                                                            </div>
+                                                        </>
+                                                    )}
+
+                                                    {localStorageType === "efs" && (
+                                                        <div className="form-group">
+                                                            <label className="form-label">EFS Base Directory Path</label>
+                                                            <input 
+                                                                type="text" 
+                                                                className="form-input" 
+                                                                placeholder="e.g. ."
+                                                                value={localEfsBasePath}
+                                                                onChange={e => setLocalEfsBasePath(e.target.value)}
+                                                            />
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                        
+                                        {jobError && (
+                                            <div style={{ color: '#ef4444', fontSize: '0.875rem', marginTop: '0.75rem', marginBottom: '0.75rem' }}>
+                                                Error: {jobError}
+                                            </div>
+                                        )}
+                                        
+                                        <div className="modal-footer" style={{ borderTop: '1px solid #374151', paddingTop: '1rem', marginTop: '1rem' }}>
+                                            <button className="btn btn-secondary" onClick={() => setIsModalOpen(false)}>
+                                                Cancel
+                                            </button>
+                                            <button 
+                                                className="btn btn-primary" 
+                                                onClick={handleStartGeneration}
+                                                disabled={!githubUrl.trim()}
+                                            >
+                                                Build Wiki
+                                            </button>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    )}
                 </div>
             );
         };

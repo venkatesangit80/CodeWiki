@@ -45,18 +45,27 @@ def init(repo_path: str, repo_id: str, tech: str):
     config.save_to_yaml(config_path)
     click.echo(f"Initialized default configuration in {config_path}")
 
+def _write_document_both_formats(storage, config, base_path, doc_type, content):
+    # 1. Write the markdown file
+    md_path = f"{base_path}.md"
+    storage.write_file(md_path, content)
+    logger.info(f"Written Markdown document to {md_path}")
+    
+    # 2. PDF compilation has been disabled as requested by the user
+    pass
+
 def _run_generation(config: GeneratorConfig, repo_cfg: RepoConfig, output_dir_override: str = None):
     repo_id = repo_cfg.repo_id
     local_path = repo_cfg.local_path or "."
 
     # Determine dynamic structured output path: repo_docs/<tech>/<component>/<date>/
     if output_dir_override:
-        config.output.output_dir = os.path.abspath(output_dir_override)
+        config.output.output_dir = output_dir_override
     else:
         tech = repo_cfg.tech or "generic"
         component = repo_id.split('/')[-1]
         date_str = datetime.date.today().isoformat()
-        config.output.output_dir = os.path.abspath(os.path.join(".", "repo_docs", tech, component, date_str))
+        config.output.output_dir = os.path.join("repo_docs", tech, component, date_str)
 
     logger.info(f"Resolved output directory: {config.output.output_dir}")
 
@@ -193,47 +202,36 @@ def _run_generation(config: GeneratorConfig, repo_cfg: RepoConfig, output_dir_ov
 
     # 4. Document Assembly
     logger.info("Assembling generated sections into final documents...")
-    os.makedirs(config.output.output_dir, exist_ok=True)
+    from codedoc_generator.storage import get_storage_provider
+    storage = get_storage_provider(config)
     
     hldd_doc = DocumentAssembler.assemble_hldd(hldd_data)
-    hldd_path = os.path.join(config.output.output_dir, f"HLDD_{repo_id.replace('/', '__')}.md")
-    with open(hldd_path, "w") as f:
-        f.write(hldd_doc)
-    logger.info(f"Written HLDD to {hldd_path}")
+    hldd_base = os.path.join(config.output.output_dir, f"HLDD_{repo_id.replace('/', '__')}")
+    _write_document_both_formats(storage, config, hldd_base, "HLDD", hldd_doc)
     
     lldd_doc = DocumentAssembler.assemble_lldd(lldd_modules)
-    lldd_path = os.path.join(config.output.output_dir, f"LLDD_{repo_id.replace('/', '__')}.md")
-    with open(lldd_path, "w") as f:
-        f.write(lldd_doc)
-    logger.info(f"Written LLDD to {lldd_path}")
+    lldd_base = os.path.join(config.output.output_dir, f"LLDD_{repo_id.replace('/', '__')}")
+    _write_document_both_formats(storage, config, lldd_base, "LLDD", lldd_doc)
 
     # Generate Architecture Synthesis Document
     synthesis_doc = loop.run_until_complete(orchestrator.generate_architecture_synthesis())
-    synth_path = os.path.join(config.output.output_dir, f"Architecture_Synthesis_{repo_id.replace('/', '__')}.md")
-    with open(synth_path, "w") as f:
-        f.write(synthesis_doc)
-    logger.info(f"Written Architecture Synthesis to {synth_path}")
+    synth_base = os.path.join(config.output.output_dir, f"Architecture_Synthesis_{repo_id.replace('/', '__')}")
+    _write_document_both_formats(storage, config, synth_base, "Architecture Synthesis", synthesis_doc)
     
     # Generate SRE Audit Document
     sre_audit_doc = loop.run_until_complete(orchestrator.generate_sre_audit())
-    sre_audit_path = os.path.join(config.output.output_dir, f"SRE_Audit_{repo_id.replace('/', '__')}.md")
-    with open(sre_audit_path, "w") as f:
-        f.write(sre_audit_doc)
-    logger.info(f"Written SRE Audit to {sre_audit_path}")
+    sre_base = os.path.join(config.output.output_dir, f"SRE_Audit_{repo_id.replace('/', '__')}")
+    _write_document_both_formats(storage, config, sre_base, "SRE Audit", sre_audit_doc)
     
     # Generate RCA Context Prompt Document
     rca_prompt_doc = loop.run_until_complete(orchestrator.generate_rca_context_prompt(sre_audit_doc, hldd_data))
-    rca_path = os.path.join(config.output.output_dir, f"RCA_Context_Prompt_{repo_id.replace('/', '__')}.md")
-    with open(rca_path, "w") as f:
-        f.write(rca_prompt_doc)
-    logger.info(f"Written RCA Context Prompt to {rca_path}")
+    rca_base = os.path.join(config.output.output_dir, f"RCA_Context_Prompt_{repo_id.replace('/', '__')}")
+    _write_document_both_formats(storage, config, rca_base, "RCA Context Prompt", rca_prompt_doc)
     
     for feat_name, doc in feature_docs:
-        feat_file = f"Feature_{feat_name.replace('.', '_')}.md"
-        feat_path = os.path.join(config.output.output_dir, feat_file)
-        with open(feat_path, "w") as f:
-            f.write(doc)
-        logger.info(f"Written Feature Walkthrough to {feat_path}")
+        feat_file_base = f"Feature_{feat_name.replace('.', '_')}"
+        feat_base = os.path.join(config.output.output_dir, feat_file_base)
+        _write_document_both_formats(storage, config, feat_base, f"Feature: {feat_name}", doc)
 
     # Commit hashing state for subsequent incremental runs
     ingestor.commit_state()

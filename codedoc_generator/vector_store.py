@@ -34,12 +34,21 @@ class LocalVectorStore:
         self.model = embedding_model
         self.endpoint = embedding_endpoint
         
-        # Ensure parent directories exist
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-        self._init_db()
+        if db_path == ":memory:":
+            self.conn = sqlite3.connect(":memory:")
+            self._init_db_conn(self.conn)
+        else:
+            self.conn = None
+            # Ensure parent directories exist
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+            self._init_db()
 
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
+        self._init_db_conn(conn)
+        conn.close()
+
+    def _init_db_conn(self, conn):
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS vectors (
@@ -55,9 +64,22 @@ class LocalVectorStore:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_repo ON vectors (repo_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_filepath ON vectors (file_path)")
         conn.commit()
-        conn.close()
+
+    def _get_connection(self) -> Tuple[sqlite3.Connection, bool]:
+        if self.db_path == ":memory:":
+            return self.conn, False
+        return sqlite3.connect(self.db_path), True
+
+    def __del__(self):
+        if getattr(self, "conn", None) is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
     def get_embedding(self, text: str) -> List[float]:
+        if getattr(self, "provider", "").lower() in ("mock", "in-memory", "none"):
+            return []
         try:
             # Clean up the URL format
             url = self.endpoint.rstrip("/")
@@ -94,35 +116,44 @@ class LocalVectorStore:
             logger.warning(f"Could not generate embedding for {record_id}, saving dummy zero vector")
             embedding = [0.0] * 384  # standard fallback dimension
             
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO vectors (id, repo_id, file_path, metadata, chunk_text, embedding) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                record_id,
-                repo_id,
-                file_path,
-                json.dumps(metadata),
-                chunk_text,
-                json.dumps(embedding)
+        conn, should_close = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO vectors (id, repo_id, file_path, metadata, chunk_text, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    record_id,
+                    repo_id,
+                    file_path,
+                    json.dumps(metadata),
+                    chunk_text,
+                    json.dumps(embedding)
+                )
             )
-        )
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            if should_close:
+                conn.close()
 
     def delete_by_filepath(self, repo_id: str, file_path: str):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM vectors WHERE repo_id = ? AND file_path = ?", (repo_id, file_path))
-        conn.commit()
-        conn.close()
+        conn, should_close = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM vectors WHERE repo_id = ? AND file_path = ?", (repo_id, file_path))
+            conn.commit()
+        finally:
+            if should_close:
+                conn.close()
 
     def delete_by_repo(self, repo_id: str):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM vectors WHERE repo_id = ?", (repo_id,))
-        conn.commit()
-        conn.close()
+        conn, should_close = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM vectors WHERE repo_id = ?", (repo_id,))
+            conn.commit()
+        finally:
+            if should_close:
+                conn.close()
 
     def retrieve(self, query: str, filters: Dict[str, Any], top_k: int = 10) -> List[Tuple[VectorRecord, float]]:
         """
@@ -131,16 +162,19 @@ class LocalVectorStore:
         """
         # If query is empty, just fetch all matching records without embeddings
         if not query:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            sql = "SELECT id, repo_id, file_path, metadata, chunk_text, embedding FROM vectors WHERE 1=1"
-            params = []
-            if "repo_id" in filters:
-                sql += " AND repo_id = ?"
-                params.append(filters["repo_id"])
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-            conn.close()
+            conn, should_close = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                sql = "SELECT id, repo_id, file_path, metadata, chunk_text, embedding FROM vectors WHERE 1=1"
+                params = []
+                if "repo_id" in filters:
+                    sql += " AND repo_id = ?"
+                    params.append(filters["repo_id"])
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+            finally:
+                if should_close:
+                    conn.close()
             
             results = []
             for row in rows:
@@ -156,25 +190,28 @@ class LocalVectorStore:
         query_vector = self.get_embedding(query)
         if not query_vector:
             logger.warning("Could not compute embedding for search query, falling back to SQLite keyword search")
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            sql = "SELECT id, repo_id, file_path, metadata, chunk_text, embedding FROM vectors WHERE 1=1"
-            params = []
-            if "repo_id" in filters:
-                sql += " AND repo_id = ?"
-                params.append(filters["repo_id"])
-            
-            # Add LIKE conditions for words in query
-            words = [w.strip().replace("'", "").replace('"', '') for w in query.split() if len(w.strip()) > 2]
-            if words:
-                like_clauses = " AND (" + " OR ".join("chunk_text LIKE ?" for _ in words) + ")"
-                sql += like_clauses
-                for w in words:
-                    params.append(f"%{w}%")
-                    
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-            conn.close()
+            conn, should_close = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                sql = "SELECT id, repo_id, file_path, metadata, chunk_text, embedding FROM vectors WHERE 1=1"
+                params = []
+                if "repo_id" in filters:
+                    sql += " AND repo_id = ?"
+                    params.append(filters["repo_id"])
+                
+                # Add LIKE conditions for words in query
+                words = [w.strip().replace("'", "").replace('"', '') for w in query.split() if len(w.strip()) > 2]
+                if words:
+                    like_clauses = " AND (" + " OR ".join("chunk_text LIKE ?" for _ in words) + ")"
+                    sql += like_clauses
+                    for w in words:
+                        params.append(f"%{w}%")
+                        
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+            finally:
+                if should_close:
+                    conn.close()
             
             results = []
             for row in rows:
@@ -183,23 +220,34 @@ class LocalVectorStore:
                 if "file_path_prefix" in filters:
                     if not file_path.startswith(filters["file_path_prefix"]):
                         continue
+                
+                # Calculate simple keyword overlap relevance score
+                text_lower = chunk_text.lower()
+                score = sum(1.0 for w in words if w.lower() in text_lower)
+                
                 record = VectorRecord(rec_id, repo_id, file_path, metadata, chunk_text, [])
-                results.append((record, 1.0))
+                results.append((record, score))
+                
+            # Sort by relevance score in descending order
+            results.sort(key=lambda x: x[1], reverse=True)
             return results[:top_k]
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn, should_close = self._get_connection()
+        try:
+            cursor = conn.cursor()
 
-        # Build SQL query based on filters
-        sql = "SELECT id, repo_id, file_path, metadata, chunk_text, embedding FROM vectors WHERE 1=1"
-        params = []
-        if "repo_id" in filters:
-            sql += " AND repo_id = ?"
-            params.append(filters["repo_id"])
-        
-        cursor.execute(sql, params)
-        rows = cursor.fetchall()
-        conn.close()
+            # Build SQL query based on filters
+            sql = "SELECT id, repo_id, file_path, metadata, chunk_text, embedding FROM vectors WHERE 1=1"
+            params = []
+            if "repo_id" in filters:
+                sql += " AND repo_id = ?"
+                params.append(filters["repo_id"])
+            
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+        finally:
+            if should_close:
+                conn.close()
 
         results: List[Tuple[VectorRecord, float]] = []
         for row in rows:

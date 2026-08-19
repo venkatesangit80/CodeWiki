@@ -1,0 +1,43 @@
+analysis:
+  call_graph_traversal_depth: 5
+  ignore_paths:
+  - .git
+  - node_modules
+  - dist
+  - build
+  - __pycache__
+  - venv
+  - target
+  - .mvn
+  - src/test
+  module_granularity: directory
+embedding:
+  endpoint: ""
+  model: mock-nomic
+  provider: mock
+github:
+  auth_token_env: GITHUB_PAT
+llm:
+  context_window_tokens: 128000
+  endpoint: nats://ec2-54-191-170-106.us-west-2.compute.amazonaws.com:4222
+  model: qwen2.5-coder:7b
+  provider: nats
+  nats_user: js_everyops
+  nats_password: 8BcUaUYxOnVG8g1T
+  temperature: 0.2
+output:
+  formats:
+  - markdown
+  output_dir: repo_docs/solver/psa-sequence-builder
+repos:
+- branch: main
+  local_path: /Users/venkatesansubramanian/AntiGravityProjects/cwr-sequence-builder-service-main
+  repo_id: AAInternal/psa-sequence-builder
+  tech: solver
+vector_store:
+  backend: sqlite
+  path: ":memory:"
+storage:
+  type: efs
+  connection_settings:
+    base_path: /Users/venkatesansubramanian/AntiGravityProjects/Code_Wiki/CodeWiki

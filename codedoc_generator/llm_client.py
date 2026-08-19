@@ -61,10 +61,28 @@ class NatsCompletionsClient(BaseLLMClient):
             logger.error("NATS library (nats-py) is not installed. Cannot use NATS LLM provider.")
             return "NATS LLM provider failed: nats-py library not installed."
 
-        nats_url = self.config.llm.endpoint
-        user = self.config.llm.nats_user
-        password = self.config.llm.nats_password
+        nats_url = os.getenv("NATS_SERVER_URL", self.config.llm.endpoint)
+        user = os.getenv("NATS_USER", self.config.llm.nats_user)
+        password = os.getenv("NATS_PASSWORD", self.config.llm.nats_password)
         
+        # Open Bao/Vault integration override for LLM Config
+        try:
+            from app.storage.vault_integration import is_vault_enabled, refresh_and_read
+            if is_vault_enabled():
+                vault_env = os.environ.get('CLOUD_VAULT_ENV', 'production')
+                vault_realm = os.environ.get('VAULT_REALM', 'teksecur')
+                # First try realm specific configuration
+                vault_config = refresh_and_read(f"{vault_env}/{vault_realm}/ai/config")
+                if not vault_config:
+                    # Fall back to common configuration
+                    vault_config = refresh_and_read(f"{vault_env}/common/ai/config")
+                if vault_config:
+                    nats_url = vault_config.get("NATS_SERVER_URL") or nats_url
+                    user = vault_config.get("NATS_USER") or user
+                    password = vault_config.get("NATS_PASSWORD") or password
+        except Exception:
+            pass
+            
         logger.info(f"Connecting to NATS broker at {nats_url}")
         
         try:

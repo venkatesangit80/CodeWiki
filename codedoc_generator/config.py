@@ -1,6 +1,6 @@
 import os
 import yaml
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 class RepoConfig(BaseModel):
@@ -42,6 +42,10 @@ class OutputConfig(BaseModel):
     formats: List[str] = Field(default_factory=lambda: ["markdown"])
     output_dir: str = "./docs/codedoc"
 
+class StorageConfig(BaseModel):
+    type: str = "efs"  # efs | s3 | azure
+    connection_settings: Dict[str, Any] = Field(default_factory=dict)
+
 class GeneratorConfig(BaseModel):
     repos: List[RepoConfig] = Field(default_factory=list)
     github: GitHubConfig = Field(default_factory=GitHubConfig)
@@ -50,6 +54,7 @@ class GeneratorConfig(BaseModel):
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
 
     @classmethod
     def load_from_yaml(cls, path: str) -> "GeneratorConfig":
